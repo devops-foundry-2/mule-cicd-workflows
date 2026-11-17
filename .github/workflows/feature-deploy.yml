@@ -1,0 +1,94 @@
+# ============================================================================================
+# feature-deploy.yml — Manual deploy of a feature or bugfix branch to Design or Sandbox.
+#
+# Triggered by workflow_dispatch only. The engineer selects the target tier and business group.
+# The deploy follows the same gate + wave pattern as build-publish.yml but for a single
+# BG + tier, with no SNAPSHOT strip and no auto-progression to the next tier.
+#
+# GitHub Environment gate: EMEA-Design / EMEA-Sandbox / AMER-Design / AMER-Sandbox
+# (required reviewers on each environment protect against accidental deploys).
+# ============================================================================================
+name: mdf-feature-deploy
+
+on:
+  workflow_call:
+    inputs:
+      tier:
+        description: "Target tier: Design or Sandbox"
+        type: string
+        required: true
+      bg-key:
+        description: "Business-group key, e.g. emea or amer"
+        type: string
+        required: true
+      bg-prefix:
+        description: "Upper-case variable prefix for the BG, e.g. EMEA or AMER"
+        type: string
+        required: true
+      deployment-target:
+        type: string
+        required: false
+        default: ch2
+      settings-xml-secret:
+        type: string
+        required: false
+        default: MAVEN_SETTINGS_XML
+      runs-on:
+        type: string
+        required: false
+        default: ubuntu-latest
+      templates-repository:
+        type: string
+        required: false
+        default: ''
+      templates-ref:
+        type: string
+        required: false
+        default: main
+      env-settings-repository:
+        type: string
+        required: false
+        default: ''
+      env-settings-ref:
+        type: string
+        required: false
+        default: develop
+
+concurrency:
+  group: mdf-feature-deploy-${{ github.repository }}-${{ inputs.tier }}-${{ inputs.bg-key }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (feature branch, no SNAPSHOT strip)
+    uses: ./.github/workflows/build.yml
+    with:
+      maven-goals: clean deploy
+      skip-tests: true
+      strip-snapshot: false
+      settings-xml-secret: ${{ inputs.settings-xml-secret }}
+      runs-on: ${{ inputs.runs-on }}
+      templates-repository: ${{ inputs.templates-repository }}
+      templates-ref: ${{ inputs.templates-ref }}
+    secrets: inherit
+
+  deploy:
+    name: Deploy to ${{ inputs.tier }} (${{ inputs.bg-key }})
+    needs: build
+    uses: ./.github/workflows/deploy-cloudhub2.yml
+    with:
+      tier: ${{ inputs.tier }}
+      stage-label: ${{ inputs.tier }}
+      env-settings-path: env-settings/${{ lower(inputs.tier) }}
+      bg-key: ${{ inputs.bg-key }}
+      bg-prefix: ${{ inputs.bg-prefix }}
+      github-environment: ${{ inputs.bg-prefix }}-${{ inputs.tier }}
+      deployment-target: ${{ inputs.deployment-target }}
+      enable-rollback: false
+      runs-on: ${{ inputs.runs-on }}
+      settings-xml-secret: ${{ inputs.settings-xml-secret }}
+      templates-repository: ${{ inputs.templates-repository }}
+      templates-ref: ${{ inputs.templates-ref }}
+      env-settings-repository: ${{ inputs.env-settings-repository }}
+      env-settings-ref: ${{ inputs.env-settings-ref }}
+    secrets: inherit

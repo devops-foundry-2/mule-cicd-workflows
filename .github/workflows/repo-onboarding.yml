@@ -1,0 +1,169 @@
+# ============================================================================================
+# repo-onboarding.yml — self-service MuleSoft API repo onboarding (GitHub Actions)
+# --------------------------------------------------------------------------------------------
+# GitHub counterpart of repo_onboarding/repo-onboarding-pipeline.yml (the Azure "initial-repo-setup"
+# pipeline). Manual trigger only. Runs repo_onboarding/create-repo-github.sh, which reuses the customized
+# create-repo.sh for every platform-neutral step and talks to GitHub for the rest.
+#
+# The `bg` options mirror the Azure dropdown; the foundry re-seeds them from the customized Azure
+# pipeline at setup (one list, both planes). The BG's Anypoint org id is read from the Actions variables
+# (ANYPOINT_BG_ID, or <BGKEY>_ANYPOINT_BG_ID on a multi-BG foundation) — the Azure variable group.
+#
+# Secrets: ONBOARDING_TOKEN — a token for the script's GitHub work only (repo create, contents,
+#   workflows, administration for rulesets; classic PAT scopes repo + workflow + admin:org). It is NOT a
+#   Maven credential. MAVEN_SETTINGS_XML — the base64 settings.xml for `mvn archetype:generate`.
+# ============================================================================================
+name: repo-onboarding
+
+on:
+  workflow_dispatch:
+    inputs:
+      bg:
+        description: Business Group
+        type: choice
+        default: americas
+        options:
+          - SalesForce
+          - americas
+          - asia
+          - europe
+      apiName:
+        description: Core API Name (e.g., dealer-mgmt, customer-sync)
+        type: string
+        default: sample-api
+      apiLayer:
+        description: API Layer Type
+        type: choice
+        default: System
+        options:
+          - System
+          - Process
+          - Experience
+          - Omni
+          - Api Proxy
+      deploymentTarget:
+        description: Deployment Target (Mule runtime)
+        type: choice
+        default: RTF
+        options:
+          - RTF
+          - CH2
+          - ONPREM
+      hasRaml:
+        description: API has a RAML spec published to Exchange?
+        type: boolean
+        default: true
+      ramlArtifactId:
+        description: RAML artifact name in Exchange (AUTO = use API name)
+        type: string
+        default: AUTO
+      ramlVersion:
+        description: RAML artifact version in Exchange
+        type: string
+        default: 1.0.0
+      additionalDeploymentBGs:
+        description: Additional BGs to deploy to (comma-separated, or 'none')
+        type: string
+        default: none
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repo-onboarding-${{ inputs.apiName }}
+  cancel-in-progress: false
+
+jobs:
+  provisioning:
+    name: Provision MuleSoft API Resources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Java 17 (needed for Maven)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # mule-maven-plugin 4.x needs Maven <= 3.9.4 (newer resolvers dropped DefaultMirrorSelector.add()).
+      - name: Use Maven ${{ vars.MDF_MAVEN_VERSION || '3.9.4' }}
+        env:
+          MDF_MVN_VERSION: ${{ vars.MDF_MAVEN_VERSION || '3.9.4' }}
+        run: |
+          set -euo pipefail
+          [[ "$MDF_MVN_VERSION" =~ ^3\.[0-9]+\.[0-9]+$ ]] || { echo "::error::MDF_MAVEN_VERSION '$MDF_MVN_VERSION' is not a Maven 3.x.y version."; exit 1; }
+          current="$(mvn --version 2>/dev/null | sed -nE 's/^Apache Maven ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)" || current=""
+          if [[ "$current" == "$MDF_MVN_VERSION" ]]; then
+            echo "Maven $MDF_MVN_VERSION already installed — skipping download."
+            exit 0
+          fi
+          dir="$RUNNER_TEMP/apache-maven-$MDF_MVN_VERSION"
+          if [[ ! -x "$dir/bin/mvn" ]]; then
+            echo "Installing Maven $MDF_MVN_VERSION (runner has ${current:-none})..."
+            url="https://archive.apache.org/dist/maven/maven-3/$MDF_MVN_VERSION/binaries/apache-maven-$MDF_MVN_VERSION-bin.tar.gz"
+            tgz="$RUNNER_TEMP/apache-maven-$MDF_MVN_VERSION-bin.tar.gz"
+            curl -fsSL --retry 3 -o "$tgz" "$url"
+            want="$(curl -fsSL --retry 3 "$url.sha512" | awk '{print $1}')"
+            if command -v sha512sum >/dev/null 2>&1; then got="$(sha512sum "$tgz" | awk '{print $1}')"; else got="$(shasum -a 512 "$tgz" | awk '{print $1}')"; fi
+            [[ -n "$want" && "$got" == "$want" ]] || { echo "::error::Maven $MDF_MVN_VERSION download failed its SHA-512 check."; exit 1; }
+            tar -xzf "$tgz" -C "$RUNNER_TEMP"
+            rm -f "$tgz"
+          fi
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          echo "Installed Maven $MDF_MVN_VERSION at $dir/bin/mvn"
+
+      # Archetype credentials live in the settings.xml server (as on Azure); nothing secret is passed to
+      # the script through env except the onboarding token.
+      - name: Download Maven settings.xml (archetype credentials)
+        env:
+          SETTINGS_B64: ${{ secrets.MAVEN_SETTINGS_XML }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SETTINGS_B64" || "$SETTINGS_B64" == "__FILL_ME__" ]]; then
+            echo "::warning::MAVEN_SETTINGS_XML is not set — mvn falls back to ~/.m2/settings.xml (the archetype model needs it)."
+            exit 0
+          fi
+          dir="$RUNNER_TEMP/mdf-secure-files"; mkdir -p "$dir"; chmod 700 "$dir"; umask 077
+          printf '%s' "$SETTINGS_B64" | base64 -d > "$dir/settings.xml"
+          # Refuse a settings.xml of another control plane, organization or repository host.
+          # Never print its content, hosts or names: the job log is visible to everyone with read access.
+          f="$dir/settings.xml"
+          fix="Re-upload MAVEN_SETTINGS_XML with the clean GitHub-only settings.xml generated during onboarding."
+          if grep -qiE 'dev\.azure\.com|visualstudio\.com|azure-artifacts|Azure Artifacts|Azure FEED PAT|ADO SECURE FILE|Pipelines -> Library|DownloadSecureFile|SYSTEM_ACCESSTOKEN|System\.AccessToken|ONBOARDING_PAT' "$f"; then
+            echo "::error::MAVEN_SETTINGS_XML holds Azure DevOps content (Azure Artifacts feeds, server ids or ADO instructions). $fix"
+            exit 1
+          fi
+          gh_host="$(printf '%s' "${GITHUB_SERVER_URL:-https://github.com}" | sed -E 's#^https?://##; s#/.*$##' | tr '[:upper:]' '[:lower:]')"
+          while IFS= read -r host; do
+            case "$host" in
+              maven.pkg.github.com|repository.mulesoft.org|repository-master.mulesoft.org|repo1.maven.org|repo.maven.apache.org|maven.anypoint.mulesoft.com|*.anypoint.mulesoft.com|"$gh_host"|"maven.$gh_host") ;;
+              *)
+                echo "::error::MAVEN_SETTINGS_XML has a repository outside GitHub Packages, MuleSoft, Maven Central and Anypoint Exchange. $fix"
+                exit 1 ;;
+            esac
+          done < <(grep -oiE '<url>[^<]*</url>' "$f" | sed -E 's#<[^>]*>##g; s#^[[:space:]]*[A-Za-z]+://##; s#^[^/@]*@##; s#[/:?].*$##' | tr '[:upper:]' '[:lower:]')
+          if grep -oiE '(maven\.pkg\.github\.com|/_registry/maven)/[A-Za-z0-9_.-]+' "$f" | sed -E 's#.*/##' | grep -vixF "$GITHUB_REPOSITORY_OWNER" >/dev/null; then
+            echo "::error::MAVEN_SETTINGS_XML points at GitHub Packages of another organization. $fix"
+            exit 1
+          fi
+          echo "MAVEN_SETTINGS_PATH=$dir/settings.xml" >> "$GITHUB_ENV"
+
+      - name: Execute onboarding script
+        env:
+          BG: ${{ inputs.bg }}
+          API_NAME: ${{ inputs.apiName }}
+          API_LAYER: ${{ inputs.apiLayer }}
+          DEPLOYMENT_TARGET: ${{ inputs.deploymentTarget }}
+          HAS_RAML: ${{ inputs.hasRaml }}
+          RAML_ARTIFACT_ID: ${{ inputs.ramlArtifactId }}
+          RAML_VERSION: ${{ inputs.ramlVersion }}
+          ADDITIONAL_DEPLOYMENT_BGS: ${{ inputs.additionalDeploymentBGs }}
+          GITHUB_ORG: ${{ github.repository_owner }}
+          VARS_JSON: ${{ toJSON(vars) }}
+          GH_TOKEN: ${{ secrets.ONBOARDING_TOKEN }}
+          # Client repo names (the foundry fills these at setup when the base repos were renamed).
+          ENV_SETTINGS_REPO_NAME: mule-app-env-settings
+          APP_TEMPLATE_REPO: template-sample-api
+          APP_TEMPLATE_ONPREM_REPO: template-onprem-sample-api
+        run: bash repo_onboarding/create-repo-github.sh

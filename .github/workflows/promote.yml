@@ -1,0 +1,114 @@
+# ============================================================================================
+# production.yml — GitHub form of pipelines/production-template.yml (merge to master/main):
+# Resolve release GAV from pom.xml -> PROD wave (all BGs), every BG behind the PROD gate.
+# See build-and-pre-release.yml for the business-groups / multi-bg-mode contract.
+# ============================================================================================
+name: mdf-production
+
+on:
+  workflow_call:
+    inputs:
+      deployment-target:
+        type: string
+        required: false
+        default: ch2
+      settings-xml-secret:
+        type: string
+        required: false
+        default: MAVEN_SETTINGS_XML
+      runs-on:
+        type: string
+        required: false
+        default: ubuntu-latest
+      enable-rollback:
+        type: boolean
+        required: false
+        default: true
+      multi-bg-mode:
+        type: string
+        required: false
+        default: sequential
+      business-groups:
+        type: string
+        required: false
+        default: '[{"key":"gdc","prefix":"GDC"}]'
+      templates-repository:
+        type: string
+        required: false
+        default: ''
+      templates-ref:
+        type: string
+        required: false
+        default: main
+      env-settings-repository:
+        type: string
+        required: false
+        default: ''
+      env-settings-ref:
+        type: string
+        required: false
+        default: develop
+
+concurrency:
+  group: mdf-pipeline-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PROD_TEMPLATES_REPOSITORY: ${{ inputs.templates-repository != '' && inputs.templates-repository || format('{0}/mule-cicd-workflows', github.repository_owner) }}
+
+jobs:
+  resolve-gav:
+    name: Resolve Release GAV
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout pipeline templates
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PROD_TEMPLATES_REPOSITORY }}
+          ref: ${{ inputs.templates-ref }}
+          token: ${{ secrets.TEMPLATES_REPO_TOKEN || secrets.ENV_SETTINGS_TOKEN || github.token }}
+          path: .mdf-templates
+          persist-credentials: false
+
+      - name: Resolve Release GAV from pom.xml
+        id: resolveGAV
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: resolve-release-gav.sh
+
+      - name: Publish Build Metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata
+          path: ${{ runner.temp }}/artifact-staging/build-metadata
+          if-no-files-found: error
+          overwrite: true
+
+  prod:
+    name: PROD (${{ matrix.bg.key }})
+    needs: resolve-gav
+    strategy:
+      fail-fast: ${{ inputs.multi-bg-mode == 'sequential' }}
+      max-parallel: ${{ inputs.multi-bg-mode == 'sequential' && 1 || 64 }}
+      matrix:
+        bg: ${{ fromJSON(inputs.business-groups) }}
+    uses: ./.github/workflows/deploy-cloudhub2.yml
+    with:
+      tier: Production
+      stage-label: Production
+      env-settings-path: env-settings/production
+      bg-key: ${{ matrix.bg.key }}
+      bg-prefix: ${{ matrix.bg.prefix }}
+      github-environment: ${{ matrix.bg.prefix != '' && format('{0}-Production', matrix.bg.prefix) || 'Production' }}
+      deployment-target: ${{ inputs.deployment-target }}
+      enable-rollback: ${{ inputs.enable-rollback }}
+      runs-on: ${{ inputs.runs-on }}
+      settings-xml-secret: ${{ inputs.settings-xml-secret }}
+      templates-repository: ${{ inputs.templates-repository }}
+      templates-ref: ${{ inputs.templates-ref }}
+      env-settings-repository: ${{ inputs.env-settings-repository }}
+      env-settings-ref: ${{ inputs.env-settings-ref }}
+    secrets: inherit

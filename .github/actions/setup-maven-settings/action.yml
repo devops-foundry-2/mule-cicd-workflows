@@ -1,0 +1,140 @@
+name: setup-maven-settings
+description: >-
+  GitHub equivalent of the Azure JavaToolInstaller@0 (JDK 17, pre-installed) + DownloadSecureFile@1
+  (settings.xml) + Cache@2 (Maven repository) step trio. Writes the decoded settings.xml to the runner
+  temp dir and exports MDF_SETTINGS_XML (the scripts' $(settingsXml.secureFilePath)) for later steps.
+
+inputs:
+  settings-xml-b64:
+    description: >-
+      Base64-encoded settings.xml (pass a secret, e.g. secrets.MAVEN_SETTINGS_XML). The plugin's
+      plane_upload_secure_file seeds it as base64 so newlines survive the secret store.
+    required: true
+  cache-key:
+    description: >-
+      actions/cache key for the Maven repository (mirrors the Azure Cache@2 key of the step).
+      Empty = no cache (for steps that have no Cache@2 on Azure).
+    required: false
+    default: ''
+  cache-restore-keys:
+    description: actions/cache restore-keys (mirrors the Azure Cache@2 restoreKeys).
+    required: false
+    default: ''
+  java-version:
+    description: JDK major version (Mule 4.x runtimes require 17).
+    required: false
+    default: '17'
+  maven-version:
+    description: >-
+      Maven version put on PATH. mule-maven-plugin 4.x calls the Maven Resolver API
+      DefaultMirrorSelector.add(), which the resolver shipped with newer Maven 3.9.x no longer has
+      (NoSuchMethodError at process-sources). 3.9.4 is the last verified version.
+    required: false
+    default: '3.9.4'
+
+runs:
+  using: composite
+  steps:
+    - id: jdk
+      shell: bash
+      env:
+        MDF_JAVA_VERSION: ${{ inputs.java-version }}
+      run: |
+        set -euo pipefail
+        var="JAVA_HOME_${MDF_JAVA_VERSION}_X64"
+        home="${!var:-}"
+        if [[ -n "$home" && -x "$home/bin/java" ]]; then
+          echo "JAVA_HOME=$home" >> "$GITHUB_ENV"
+          echo "$home/bin" >> "$GITHUB_PATH"
+          echo "preinstalled=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "preinstalled=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - if: steps.jdk.outputs.preinstalled != 'true'
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ inputs.java-version }}
+
+    - id: maven
+      shell: bash
+      env:
+        MDF_MVN_VERSION: ${{ inputs.maven-version }}
+      run: |
+        set -euo pipefail
+        [[ "$MDF_MVN_VERSION" =~ ^3\.[0-9]+\.[0-9]+$ ]] || { echo "::error::maven-version '$MDF_MVN_VERSION' is not a Maven 3.x.y version."; exit 1; }
+        current="$(mvn --version 2>/dev/null | sed -nE 's/^Apache Maven ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)" || current=""
+        if [[ "$current" == "$MDF_MVN_VERSION" ]]; then
+          echo "Maven $MDF_MVN_VERSION already installed — skipping download."
+          exit 0
+        fi
+        dir="$RUNNER_TEMP/apache-maven-$MDF_MVN_VERSION"
+        if [[ ! -x "$dir/bin/mvn" ]]; then
+          echo "Installing Maven $MDF_MVN_VERSION (runner has ${current:-none})..."
+          url="https://archive.apache.org/dist/maven/maven-3/$MDF_MVN_VERSION/binaries/apache-maven-$MDF_MVN_VERSION-bin.tar.gz"
+          tgz="$RUNNER_TEMP/apache-maven-$MDF_MVN_VERSION-bin.tar.gz"
+          curl -fsSL --retry 3 -o "$tgz" "$url"
+          want="$(curl -fsSL --retry 3 "$url.sha512" | awk '{print $1}')"
+          if command -v sha512sum >/dev/null 2>&1; then got="$(sha512sum "$tgz" | awk '{print $1}')"; else got="$(shasum -a 512 "$tgz" | awk '{print $1}')"; fi
+          [[ -n "$want" && "$got" == "$want" ]] || { echo "::error::Maven $MDF_MVN_VERSION download failed its SHA-512 check."; exit 1; }
+          tar -xzf "$tgz" -C "$RUNNER_TEMP"
+          rm -f "$tgz"
+        fi
+        echo "$dir/bin" >> "$GITHUB_PATH"
+        echo "Installed Maven $MDF_MVN_VERSION at $dir/bin/mvn"
+
+    - if: inputs.cache-key != ''
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/pw/.m2/repository
+        key: ${{ inputs.cache-key }}
+        restore-keys: ${{ inputs.cache-restore-keys }}
+
+    - shell: bash
+      env:
+        MDF_SETTINGS_B64: ${{ inputs.settings-xml-b64 }}
+      run: |
+        set -euo pipefail
+        if [[ -z "$MDF_SETTINGS_B64" || "$MDF_SETTINGS_B64" == "__FILL_ME__" ]]; then
+          echo "::error::settings.xml secret is empty or still the __FILL_ME__ placeholder. Upload the base64 settings.xml (plugin activity: secure files) before running."
+          exit 1
+        fi
+        dir="$RUNNER_TEMP/mdf-secure-files"
+        mkdir -p "$dir"
+        chmod 700 "$dir"
+        file="$dir/settings.xml"
+        umask 077
+        if ! printf '%s' "$MDF_SETTINGS_B64" | base64 -d > "$file" 2>/dev/null || [[ ! -s "$file" ]]; then
+          echo "::error::settings.xml secret is not valid base64."
+          exit 1
+        fi
+        mkdir -p "$RUNNER_TEMP/pw/.m2/repository"
+        echo "MDF_SETTINGS_XML=$file" >> "$GITHUB_ENV"
+
+    - name: Validate settings.xml — no foreign platform repositories
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Refuse a settings.xml of another control plane, organization or repository host.
+        # Never print its content, hosts or names: the job log is visible to everyone with read access.
+        f="$RUNNER_TEMP/mdf-secure-files/settings.xml"
+        fix="Re-upload MAVEN_SETTINGS_XML with the clean GitHub-only settings.xml generated during onboarding."
+        if grep -qiE 'dev\.azure\.com|visualstudio\.com|azure-artifacts|Azure Artifacts|Azure FEED PAT|ADO SECURE FILE|Pipelines -> Library|DownloadSecureFile|SYSTEM_ACCESSTOKEN|System\.AccessToken|ONBOARDING_PAT' "$f"; then
+          echo "::error::settings.xml holds Azure DevOps content (Azure Artifacts feeds, server ids or ADO instructions). $fix"
+          exit 1
+        fi
+        gh_host="$(printf '%s' "${GITHUB_SERVER_URL:-https://github.com}" | sed -E 's#^https?://##; s#/.*$##' | tr '[:upper:]' '[:lower:]')"
+        while IFS= read -r host; do
+          case "$host" in
+            maven.pkg.github.com|repository.mulesoft.org|repository-master.mulesoft.org|repo1.maven.org|repo.maven.apache.org|maven.anypoint.mulesoft.com|*.anypoint.mulesoft.com|"$gh_host"|"maven.$gh_host") ;;
+            *)
+              echo "::error::settings.xml has a repository outside GitHub Packages, MuleSoft, Maven Central and Anypoint Exchange. $fix"
+              exit 1 ;;
+          esac
+        done < <(grep -oiE '<url>[^<]*</url>' "$f" | sed -E 's#<[^>]*>##g; s#^[[:space:]]*[A-Za-z]+://##; s#^[^/@]*@##; s#[/:?].*$##' | tr '[:upper:]' '[:lower:]')
+        if grep -oiE '(maven\.pkg\.github\.com|/_registry/maven)/[A-Za-z0-9_.-]+' "$f" | sed -E 's#.*/##' | grep -vixF "$GITHUB_REPOSITORY_OWNER" >/dev/null; then
+          echo "::error::settings.xml points at GitHub Packages of another organization. $fix"
+          exit 1
+        fi
+        echo "settings.xml platform check passed."

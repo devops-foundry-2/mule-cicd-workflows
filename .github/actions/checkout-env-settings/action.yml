@@ -1,0 +1,46 @@
+name: checkout-env-settings
+description: >-
+  GitHub equivalent of the Azure `- checkout: env-settings / path: s/env-settings` step. Checks the
+  shared env-settings repository out to $GITHUB_WORKSPACE/env-settings, which is
+  $(Pipeline.Workspace)/s/env-settings for the core/ci scripts (pw/s links to the workspace).
+
+inputs:
+  repository:
+    description: owner/name of the env-settings repository. Empty = <owner>/mule-app-env-settings.
+    required: false
+    default: ''
+  ref:
+    description: Branch, tag or SHA (Azure resources.repositories.env-settings.ref).
+    required: false
+    default: develop
+  token:
+    description: Token with contents:read on the env-settings repository (contents:write when pushing tags).
+    required: true
+  fetch-tags:
+    description: Fetch tags (Azure checkout fetchTags) — needed by the rollback tag checkout.
+    required: false
+    default: 'false'
+  persist-credentials:
+    description: Keep the token in the local git config (Azure persistCredentials) — needed to push tags.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.repository != '' && inputs.repository || format('{0}/mule-app-env-settings', github.repository_owner) }}
+        ref: ${{ inputs.ref }}
+        token: ${{ inputs.token }}
+        path: env-settings
+        fetch-tags: ${{ inputs.fetch-tags }}
+        fetch-depth: ${{ inputs.fetch-tags == 'true' && '0' || '1' }}
+        persist-credentials: ${{ inputs.persist-credentials }}
+
+    - shell: bash
+      run: |
+        set -euo pipefail
+        pw="${CI_PIPELINE_WORKSPACE:-$RUNNER_TEMP/pw}"
+        mkdir -p "$pw"
+        [[ -e "$pw/s" ]] || ln -s "$GITHUB_WORKSPACE" "$pw/s"

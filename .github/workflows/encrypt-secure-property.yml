@@ -1,0 +1,113 @@
+# ============================================================================================
+# encrypt-secure-property.yml — GitHub form of pipelines/utilities/encrypt-secure-property.yml.
+# Self-service encryption of env-secure.yaml values without access to the per-environment keys.
+# Runs in the central templates repository (it holds no application code).
+#
+#   gh workflow run encrypt-secure-property.yml -R <org>/mule-cicd-workflows \
+#     -f environment=DEV -f property-values="$(printf 'db.password=...\napi.key=...')"
+#
+# The encrypted JSON is uploaded as the `encrypted-output` artifact
+# (gh run download <run-id> -n encrypted-output).
+# ============================================================================================
+name: mdf-encrypt-secure-property
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target Environment
+        type: choice
+        options: [LOCAL, DEV, SIT, UAT, PROD]
+        required: true
+      property-values:
+        description: 'Property values to encrypt (one per line: key=value)'
+        type: string
+        required: true
+      algorithm:
+        description: Encryption Algorithm
+        type: choice
+        options: [AES, Blowfish]
+        default: AES
+      mode:
+        description: Encryption Mode
+        type: choice
+        options: [CBC]
+        default: CBC
+      tool-version:
+        description: secure-properties-tool.jar version
+        type: string
+        default: 1.0.0
+      settings-xml-secret:
+        description: Name of the secret holding the base64 settings.xml
+        type: string
+        default: MAVEN_SETTINGS_XML
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mdf-encrypt-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  encrypt:
+    name: Encrypt secure properties
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mask property values
+        env:
+          MDF_PROPERTY_VALUES: ${{ inputs.property-values }}
+        run: |
+          while IFS= read -r line; do
+            [[ "$line" == *=* ]] || continue
+            raw="${line#*=}"
+            trimmed="$(echo "$raw" | xargs 2>/dev/null || true)"
+            for value in "$raw" "$trimmed"; do
+              if [[ -n "$value" ]]; then echo "::add-mask::${value}"; fi
+            done
+          done <<< "$MDF_PROPERTY_VALUES"
+
+      - name: Checkout pipeline templates
+        uses: actions/checkout@v4
+        with:
+          path: .mdf-templates
+          persist-credentials: false
+
+      - name: Setup Java and settings.xml
+        uses: ./.mdf-templates/.github/actions/setup-maven-settings
+        with:
+          settings-xml-b64: ${{ secrets[inputs.settings-xml-secret] }}
+
+      - name: Download secure-properties-tool from Maven repository
+        id: downloadTool
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: download-secure-properties-tool.sh
+        env:
+          MDF_TOOL_VERSION: ${{ inputs.tool-version }}
+          MDF_TOOL_GROUP_ID: ${{ vars.TOOL_GROUP_ID || 'com.mulesoft.tools' }}
+          MDF_TOOL_ARTIFACT_ID: ${{ vars.TOOL_ARTIFACT_ID || 'secure-properties-tool' }}
+          MDF_AZURE_FEED_URL: ${{ vars.MAVEN_FEED_URL }}
+
+      - name: Encrypt Properties
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: encrypt-properties.sh
+        env:
+          MDF_ENVIRONMENT: ${{ inputs.environment }}
+          MDF_PROPERTY_VALUES: ${{ inputs.property-values }}
+          MDF_ALGORITHM: ${{ inputs.algorithm }}
+          MDF_MODE: ${{ inputs.mode }}
+          MDF_TOOL_JAR_PATH: ${{ fromJSON(steps.downloadTool.outputs.json).TOOL_JAR_PATH }}
+          LOCAL_SECURE_KEY: ${{ secrets.LOCAL_SECURE_KEY }}
+          DEV_SECURE_KEY: ${{ secrets.DEV_SECURE_KEY }}
+          SIT_SECURE_KEY: ${{ secrets.SIT_SECURE_KEY }}
+          UAT_SECURE_KEY: ${{ secrets.UAT_SECURE_KEY }}
+          PROD_SECURE_KEY: ${{ secrets.PROD_SECURE_KEY }}
+
+      - name: Publish Encrypted Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-output
+          path: ${{ runner.temp }}/artifact-staging/encrypted-output
+          if-no-files-found: error

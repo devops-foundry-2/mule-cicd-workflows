@@ -1,0 +1,114 @@
+# ============================================================================================
+# api-manager.yml — Flag-driven, idempotent API Manager automation.
+#
+# Called by deploy-cloudhub2.yml's create-api-components job (via run-ci-script). Exposed
+# here as a standalone callable workflow for manual or diagnostic use.
+#
+# Behaviour:
+#   IS_API=true  → ensure an API Manager instance exists for the application; inject api.id.
+#   IS_API=false → no-op (idempotent).
+#
+# The api.id is injected as a Mule application property (api.autodiscoveryID) so the runtime
+# can self-register with API Manager. The value is never committed; it is computed at deploy
+# time from the BG + environment + API version and passed as -D on the mvn deploy command.
+#
+# Variables resolved per BG: <BG_PREFIX>_ANYPOINT_BG_ID, <BG_PREFIX>_<TIER>_ENV_ID
+# Secrets: NONPROD_CONNECTED_APP_ID / SECRET for Design+Sandbox;
+#          PROD_CONNECTED_APP_ID / SECRET for Production.
+# ============================================================================================
+name: mdf-api-manager
+
+on:
+  workflow_call:
+    inputs:
+      tier:
+        description: "Design | Sandbox | Production"
+        type: string
+        required: true
+      bg-key:
+        type: string
+        required: true
+      bg-prefix:
+        type: string
+        required: false
+        default: ''
+      artifact-id:
+        description: Maven artifactId of the application being deployed.
+        type: string
+        required: true
+      asset-version:
+        description: Semantic version of the API asset on Exchange (e.g. 1.0.0).
+        type: string
+        required: false
+        default: '1.0.0'
+      enable-api-manager:
+        description: Set to false to skip all API Manager steps regardless of IS_API flag.
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        type: string
+        required: false
+        default: ubuntu-latest
+      templates-repository:
+        type: string
+        required: false
+        default: ''
+      templates-ref:
+        type: string
+        required: false
+        default: main
+
+env:
+  API_TEMPLATES_REPOSITORY: ${{ inputs.templates-repository != '' && inputs.templates-repository || format('{0}/mule-cicd-workflows', github.repository_owner) }}
+  API_BG_ID: ${{ vars[format('{0}_ANYPOINT_BG_ID', inputs.bg-prefix)] || vars.ANYPOINT_BG_ID }}
+  API_ENV_ID: ${{ vars[format('{0}_{1}_ENV_ID', inputs.bg-prefix, inputs.tier)] || vars[format('{0}_ENV_ID', inputs.tier)] }}
+
+jobs:
+  api-manager:
+    name: API Manager (${{ inputs.tier }} / ${{ inputs.bg-key }})
+    if: inputs.enable-api-manager
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Checkout pipeline templates
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.API_TEMPLATES_REPOSITORY }}
+          ref: ${{ inputs.templates-ref }}
+          token: ${{ secrets.TEMPLATES_REPO_TOKEN || github.token }}
+          path: .mdf-templates
+          persist-credentials: false
+
+      - name: Get Anypoint Access Token
+        id: getAccessToken
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: get-anypoint-token.sh
+        env:
+          MDF_CONNECTED_APP_CLIENT_ID: ${{ secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'Production' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_CLIENT_SECRET: ${{ secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'Production' && 'PROD' || 'NONPROD')] }}
+
+      - name: Detect API flags
+        id: detectFlags
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: detect-api-flags.sh
+        env:
+          MDF_BEARER_TOKEN: ${{ fromJSON(steps.getAccessToken.outputs.json).bearerToken }}
+          MDF_BG_ID: ${{ env.API_BG_ID }}
+          MDF_ENV_ID: ${{ env.API_ENV_ID }}
+          MDF_ARTIFACT_ID: ${{ inputs.artifact-id }}
+          MDF_ASSET_VERSION: ${{ inputs.asset-version }}
+
+      - name: Create API Manager instance (idempotent)
+        if: fromJSON(steps.detectFlags.outputs.json || '{}').IS_API == 'true'
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: create-api-manager-instance.sh
+        env:
+          MDF_BEARER_TOKEN: ${{ fromJSON(steps.getAccessToken.outputs.json).bearerToken }}
+          MDF_BG_ID: ${{ env.API_BG_ID }}
+          MDF_ENV_ID: ${{ env.API_ENV_ID }}
+          MDF_ARTIFACT_ID: ${{ inputs.artifact-id }}
+          MDF_ASSET_VERSION: ${{ inputs.asset-version }}
+          MDF_TIER: ${{ inputs.tier }}

@@ -1,0 +1,74 @@
+name: run-ci-script
+description: >-
+  Run one core/ci script (extracted from the Azure DevOps templates) under the GitHub Actions
+  ci-shim and expose everything it publishes with ci_set_var / ci_set_secret_var as a single JSON
+  output. Script inputs are passed as MDF_* variables in the env: of the step that uses this action.
+  Read outputs with fromJSON(steps.<id>.outputs.json).<name>.
+
+inputs:
+  script:
+    description: File name of the script under core/ci (e.g. build-mule-app.sh).
+    required: true
+
+outputs:
+  json:
+    description: JSON object of the script's step outputs ({} when it sets none).
+    value: ${{ steps.run.outputs.json }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        MDF_CORE_CI_DIR: ${{ github.action_path }}/../../../core/ci
+        MDF_CI_SCRIPT: ${{ inputs.script }}
+      run: |
+        set -euo pipefail
+        if [[ ! "$MDF_CI_SCRIPT" =~ ^[a-z0-9][a-z0-9-]*\.sh$ ]]; then
+          echo "::error::run-ci-script: invalid script name '$MDF_CI_SCRIPT'"
+          exit 1
+        fi
+        core_dir="$(cd "$MDF_CORE_CI_DIR" && pwd)"
+        if [[ ! -f "$core_dir/$MDF_CI_SCRIPT" ]]; then
+          echo "::error::run-ci-script: core/ci/$MDF_CI_SCRIPT not found next to this action ($core_dir)"
+          exit 1
+        fi
+
+        # Azure-equivalent workspace: $(Pipeline.Workspace) = $RUNNER_TEMP/pw, with pw/s = the
+        # default working directory, so the scripts' s/env-settings, mule-artifacts, build-metadata
+        # and .m2/repository paths resolve exactly as they do on an Azure agent.
+        export CI_PIPELINE_WORKSPACE="${CI_PIPELINE_WORKSPACE:-$RUNNER_TEMP/pw}"
+        mkdir -p "$CI_PIPELINE_WORKSPACE"
+        [[ -e "$CI_PIPELINE_WORKSPACE/s" ]] || ln -s "$GITHUB_WORKSPACE" "$CI_PIPELINE_WORKSPACE/s"
+
+        CI_OUTPUT_FILE="$(mktemp "$RUNNER_TEMP/mdf-out.XXXXXX")"
+        export CI_OUTPUT_FILE
+        # Plain `bash <file>` like Azure's Bash@3: the script keeps its own set -e/-u/pipefail choice.
+        bash "$core_dir/$MDF_CI_SCRIPT"
+
+        json="$(python3 - "$CI_OUTPUT_FILE" <<'PY'
+        import json, sys
+        out, lines, i = {}, open(sys.argv[1]).read().split("\n"), 0
+        while i < len(lines):
+            line = lines[i]
+            if "<<" in line:
+                name, delim = line.split("<<", 1)
+                i += 1
+                buf = []
+                while i < len(lines) and lines[i] != delim:
+                    buf.append(lines[i])
+                    i += 1
+                out[name] = "\n".join(buf)
+            i += 1
+        print(json.dumps(out))
+        PY
+        )"
+        rm -f "$CI_OUTPUT_FILE"
+        delim="__MDF_JSON_${RANDOM}${RANDOM}__"
+        {
+          echo "json<<$delim"
+          echo "$json"
+          echo "$delim"
+        } >> "$GITHUB_OUTPUT"

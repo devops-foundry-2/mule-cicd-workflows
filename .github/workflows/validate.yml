@@ -1,0 +1,122 @@
+# ============================================================================================
+# pre-checks.yml — GitHub form of pipelines/pre-checks-template.yml (PR to develop, or a push
+# to hotfix/*): MUnit tests + optional OWASP / SonarQube quality gate. No deployment.
+# ============================================================================================
+name: mdf-pre-checks
+
+on:
+  workflow_call:
+    inputs:
+      maven-options:
+        type: string
+        required: false
+        default: -Xmx4096m
+      settings-xml-secret:
+        type: string
+        required: false
+        default: MAVEN_SETTINGS_XML
+      run-owasp:
+        type: boolean
+        required: false
+        default: false
+      run-static-analysis:
+        type: boolean
+        required: false
+        default: false
+      runs-on:
+        type: string
+        required: false
+        default: ubuntu-latest
+      templates-repository:
+        type: string
+        required: false
+        default: ''
+      templates-ref:
+        type: string
+        required: false
+        default: main
+
+concurrency:
+  group: mdf-pre-checks-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  run-tests:
+    name: Run MUnit Tests & Quality Checks
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout pipeline templates
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.templates-repository != '' && inputs.templates-repository || format('{0}/mule-cicd-workflows', github.repository_owner) }}
+          ref: ${{ inputs.templates-ref }}
+          token: ${{ secrets.TEMPLATES_REPO_TOKEN || secrets.ENV_SETTINGS_TOKEN || github.token }}
+          path: .mdf-templates
+          persist-credentials: false
+
+      - name: Setup Java, settings.xml and Maven cache
+        uses: ./.mdf-templates/.github/actions/setup-maven-settings
+        with:
+          settings-xml-b64: ${{ secrets[inputs.settings-xml-secret] }}
+          cache-key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          cache-restore-keys: maven-${{ runner.os }}
+
+      - name: Run MUnit Tests
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: run-munit.sh
+        env:
+          MDF_MAVEN_OPTIONS: ${{ inputs.maven-options }}
+          MDF_LOCAL_SECURE_KEY: ${{ secrets.LOCAL_SECURE_KEY }}
+
+      - name: Publish MUnit Test Results
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: munit-test-results-${{ github.run_number }}
+          path: '**/surefire-reports/TEST-*.xml'
+          if-no-files-found: ignore
+          overwrite: true
+
+      - name: Publish MUnit Coverage Report
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}-munit-coverage-${{ github.run_number }}
+          path: target/site/munit/coverage
+          if-no-files-found: ignore
+          overwrite: true
+
+      - name: OWASP Dependency Check (Placeholder)
+        if: inputs.run-owasp
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: owasp-dependency-check.sh
+
+      - name: SonarQube Static Analysis (Mule Plugin)
+        if: inputs.run-static-analysis
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: sonar-static-analysis.sh
+        env:
+          MDF_SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          MDF_SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Check SonarQube Quality Gate
+        if: inputs.run-static-analysis
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: sonar-quality-gate.sh
+        env:
+          MDF_SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          MDF_SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

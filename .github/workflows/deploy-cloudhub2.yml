@@ -1,0 +1,698 @@
+# ============================================================================================
+# deploy-cloudhub2.yml — ONE environment tier for ONE business group.
+#
+# GitHub form of the Azure stage triple the pipeline templates emit per BG:
+#   Pre_Deploy_<Tier>_<bg>  (stages/pre-deploy.yml)  -> approve + pre-deploy jobs
+#   Deploy_<Tier>_<bg>      (stages/deploy.yml)      -> capture-version, create-api-components,
+#                                                       deploy, tag-env-settings (PROD only)
+#   Rollback_<Tier>_<bg>    (stages/rollback.yml)    -> rollback-pre-deploy, rollback-deploy
+#
+# Gate Job Pattern: `approve` is the only job bound to the GitHub Environment (<tier>), so the
+# environment's required reviewers / wait timer / branch policy are evaluated exactly once,
+# BEFORE the first Exchange / API Manager / runtime mutation. Every later job `needs:` it.
+#
+# Called by build-and-pre-release.yml, release.yml and production.yml (matrix over BGs).
+# Variables (vars) / secrets are resolved per BG as <BG_PREFIX>_<NAME> with a fallback to the
+# unprefixed <NAME> (single-BG setups) — the GitHub form of the Azure per-BG variable group
+# mule-<bg>-platform-config + the shared mule-common-credentials group.
+# ============================================================================================
+name: mdf-deploy-cloudhub2
+
+on:
+  workflow_call:
+    inputs:
+      tier:
+        description: DEV | SIT | UAT | PROD — GitHub Environment name and variable prefix (Azure muleEnv).
+        type: string
+        required: true
+      stage-label:
+        description: Azure stage-name segment (Dev | SIT | UAT | Prod) — keeps the Azure artifact names.
+        type: string
+        required: true
+      env-settings-path:
+        description: Path inside the workspace, e.g. env-settings/dev (Azure envSettingsPath).
+        type: string
+        required: true
+      bg-key:
+        description: Business-group key (Azure bg.key).
+        type: string
+        required: true
+      bg-prefix:
+        description: Upper-case variable prefix for this BG (e.g. GDC). Empty = unprefixed names only.
+        type: string
+        required: false
+        default: ''
+      deployment-target:
+        type: string
+        required: false
+        default: ch2
+      classifier:
+        type: string
+        required: false
+        default: mule-application
+      enable-rollback:
+        type: boolean
+        required: false
+        default: false
+      runs-on:
+        description: Runner label (Azure pool.vmImage).
+        type: string
+        required: false
+        default: ubuntu-latest
+      settings-xml-secret:
+        description: Name of the secret holding the base64 settings.xml (Azure settingsXmlSecureFile).
+        type: string
+        required: false
+        default: MAVEN_SETTINGS_XML
+      templates-repository:
+        type: string
+        required: false
+        default: ''
+      templates-ref:
+        type: string
+        required: false
+        default: main
+      env-settings-repository:
+        type: string
+        required: false
+        default: ''
+      env-settings-ref:
+        type: string
+        required: false
+        default: develop
+      github-environment:
+        description: >
+          GitHub Environment name that gates this wave's approve job. Defaults to `tier`.
+          For multi-BG foundations where each BG has its own environment (e.g. EMEA-Design,
+          AMER-Design), pass `{BG_PREFIX}-{Tier}` from the caller — the tier input stays the
+          short form (Design, Sandbox, Production) for variable-name resolution.
+        type: string
+        required: false
+        default: ''
+
+concurrency:
+  group: mdf-wave-${{ github.repository }}-${{ inputs.tier }}-${{ inputs.bg-key }}
+  cancel-in-progress: false
+
+env:
+  WAVE_TEMPLATES_REPOSITORY: ${{ inputs.templates-repository != '' && inputs.templates-repository || format('{0}/mule-cicd-workflows', github.repository_owner) }}
+  WAVE_BG_ID: ${{ vars[format('{0}_ANYPOINT_BG_ID', inputs.bg-prefix)] || vars.ANYPOINT_BG_ID }}
+  WAVE_ENV_ID: ${{ vars[format('{0}_{1}_ENV_ID', inputs.bg-prefix, inputs.tier)] || vars[format('{0}_ENV_ID', inputs.tier)] }}
+  WAVE_ENV_NAME: ${{ vars[format('{0}_{1}_ENV_NAME', inputs.bg-prefix, inputs.tier)] || vars[format('{0}_ENV_NAME', inputs.tier)] }}
+  WAVE_PRE_DEPLOY_STAGE: Pre_Deploy_${{ inputs.stage-label }}_${{ inputs.bg-key }}
+  WAVE_ROLLBACK_STAGE: Rollback_${{ inputs.stage-label }}_${{ inputs.bg-key }}
+
+jobs:
+  # ── Pre_Deploy_<Tier>_<bg> ─────────────────────────────────────────────────────────────────
+  approve:
+    name: Approval Gate (${{ inputs.tier }} / ${{ inputs.bg-key }})
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.github-environment != '' && inputs.github-environment || inputs.tier }}
+    steps:
+      - name: Approval Confirmed
+        env:
+          MDF_TIER: ${{ inputs.tier }}
+          MDF_BG_KEY: ${{ inputs.bg-key }}
+        run: echo "Approval granted for ${MDF_TIER} (${MDF_BG_KEY}). Proceeding with pre-deploy."
+
+  pre-deploy:
+    name: 'Pre-Deploy: Download, Transform, Publish'
+    needs: approve
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      group-id: ${{ fromJSON(steps.preDeploy.outputs.json || '{}').projectGroupId }}
+      artifact-id: ${{ fromJSON(steps.resolveGAV.outputs.json || '{}').resolvedArtifactId }}
+      version: ${{ fromJSON(steps.resolveGAV.outputs.json || '{}').resolvedVersion }}
+    steps:
+      - name: Checkout pipeline templates
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.WAVE_TEMPLATES_REPOSITORY }}
+          ref: ${{ inputs.templates-ref }}
+          token: ${{ secrets.TEMPLATES_REPO_TOKEN || secrets.ENV_SETTINGS_TOKEN || github.token }}
+          path: .mdf-templates
+          persist-credentials: false
+
+      - name: Checkout env-settings
+        uses: ./.mdf-templates/.github/actions/checkout-env-settings
+        with:
+          repository: ${{ inputs.env-settings-repository }}
+          ref: ${{ inputs.env-settings-ref }}
+          token: ${{ secrets.ENV_SETTINGS_TOKEN }}
+
+      - name: Check business-group configuration
+        env:
+          MDF_TIER: ${{ inputs.tier }}
+          MDF_BG_PREFIX: ${{ inputs.bg-prefix }}
+        run: |
+          missing=""
+          [[ -n "$WAVE_BG_ID" ]] || missing="$missing ${MDF_BG_PREFIX:+${MDF_BG_PREFIX}_}ANYPOINT_BG_ID"
+          [[ -n "$WAVE_ENV_ID" ]] || missing="$missing ${MDF_BG_PREFIX:+${MDF_BG_PREFIX}_}${MDF_TIER}_ENV_ID"
+          if [[ -n "$missing" ]]; then
+            echo "::error::Missing GitHub variable(s):${missing} (Azure: mule-<bg>-platform-config)."
+            exit 1
+          fi
+
+      - name: Download Build Metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: build-metadata
+          path: ${{ runner.temp }}/pw/build-metadata
+
+      - name: Resolve Artifact Coordinates
+        id: resolveGAV
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: resolve-artifact-coordinates.sh
+
+      - name: Setup Java, settings.xml and Maven cache
+        uses: ./.mdf-templates/.github/actions/setup-maven-settings
+        with:
+          settings-xml-b64: ${{ secrets[inputs.settings-xml-secret] }}
+          cache-key: maven-${{ runner.os }}-download-${{ fromJSON(steps.resolveGAV.outputs.json).resolvedArtifactId }}
+          cache-restore-keys: maven-${{ runner.os }}
+
+      - name: Download Artifact from Maven repository
+        id: downloadArtifact
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: download-artifacts.sh
+        env:
+          MDF_GROUP_ID: ${{ fromJSON(steps.resolveGAV.outputs.json).resolvedGroupId }}
+          MDF_ARTIFACT_ID: ${{ fromJSON(steps.resolveGAV.outputs.json).resolvedArtifactId }}
+          MDF_VERSION: ${{ fromJSON(steps.resolveGAV.outputs.json).resolvedVersion }}
+          MDF_CLASSIFIER: ${{ inputs.classifier }}
+
+      - name: Publish Mule Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mule-application-artifacts-${{ env.WAVE_PRE_DEPLOY_STAGE }}
+          path: ${{ runner.temp }}/pw/mule-artifacts
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Get Anypoint Access Token
+        id: getAccessToken
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: get-anypoint-token.sh
+        env:
+          MDF_CONNECTED_APP_CLIENT_ID: ${{ secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_CLIENT_SECRET: ${{ secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+
+      - name: 'Pre-Deploy: Transform JAR for ${{ inputs.tier }}'
+        id: preDeploy
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: pre-deploy-mule-app.sh
+        env:
+          MDF_ARTIFACT_ID: ${{ fromJSON(steps.resolveGAV.outputs.json).resolvedArtifactId }}
+          MDF_VERSION: ${{ fromJSON(steps.resolveGAV.outputs.json).resolvedVersion }}
+          MDF_CLASSIFIER: ${{ inputs.classifier }}
+          MDF_ENV_SETTINGS_PATH: ${{ inputs.env-settings-path }}
+          MDF_MULE_ENV: ${{ inputs.tier }}
+          MDF_DEPLOYMENT_TARGET: ${{ inputs.deployment-target }}
+          MDF_BG_ID: ${{ env.WAVE_BG_ID }}
+
+      - name: Generate deploy-pom.xml
+        id: generateDeployPom
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: generate-deploy-pom.sh
+        env:
+          MDF_ARTIFACT_ID: ${{ fromJSON(steps.resolveGAV.outputs.json).resolvedArtifactId }}
+          MDF_VERSION: ${{ fromJSON(steps.resolveGAV.outputs.json).resolvedVersion }}
+          MDF_DEPLOYMENT_TARGET: ${{ inputs.deployment-target }}
+          MDF_BG_ID: ${{ env.WAVE_BG_ID }}
+          MDF_PARENT_GROUP_ID: ${{ fromJSON(steps.preDeploy.outputs.json).parentGroupId }}
+          MDF_PARENT_ARTIFACT_ID: ${{ fromJSON(steps.preDeploy.outputs.json).parentArtifactId }}
+          MDF_PARENT_VERSION: ${{ fromJSON(steps.preDeploy.outputs.json).parentVersion }}
+          MDF_PROJECT_GROUP_ID: ${{ fromJSON(steps.preDeploy.outputs.json).projectGroupId }}
+
+      - name: Publish to Exchange (CH2/RTF)
+        id: publishToExchange
+        if: inputs.deployment-target == 'ch2' || inputs.deployment-target == 'rtf'
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: publish-to-exchange.sh
+        env:
+          MDF_ARTIFACT_ID: ${{ fromJSON(steps.resolveGAV.outputs.json).resolvedArtifactId }}
+          MDF_VERSION: ${{ fromJSON(steps.resolveGAV.outputs.json).resolvedVersion }}
+          MDF_CLASSIFIER: ${{ inputs.classifier }}
+          MDF_BG_ID: ${{ env.WAVE_BG_ID }}
+          MDF_BEARER_TOKEN: ${{ fromJSON(steps.getAccessToken.outputs.json).bearerToken }}
+          MDF_PARENT_GROUP_ID: ${{ fromJSON(steps.preDeploy.outputs.json).parentGroupId }}
+          MDF_PARENT_ARTIFACT_ID: ${{ fromJSON(steps.preDeploy.outputs.json).parentArtifactId }}
+          MDF_PARENT_VERSION: ${{ fromJSON(steps.preDeploy.outputs.json).parentVersion }}
+
+      - name: Publish Deploy Config
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-config-${{ env.WAVE_PRE_DEPLOY_STAGE }}
+          path: ${{ runner.temp }}/pw/mule-artifacts/deploy-pom.xml
+          if-no-files-found: error
+          overwrite: true
+
+  # ── Deploy_<Tier>_<bg> ─────────────────────────────────────────────────────────────────────
+  capture-version:
+    name: Capture Current Deployed Version
+    needs: pre-deploy
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      is-first-deployment: ${{ fromJSON(steps.CaptureVersion.outputs.json || '{}').isFirstDeployment }}
+      prev-group-id: ${{ fromJSON(steps.CaptureVersion.outputs.json || '{}').prevGroupId }}
+      prev-artifact-id: ${{ fromJSON(steps.CaptureVersion.outputs.json || '{}').prevArtifactId }}
+      prev-version: ${{ fromJSON(steps.CaptureVersion.outputs.json || '{}').prevVersion }}
+    steps:
+      - name: Checkout pipeline templates
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.WAVE_TEMPLATES_REPOSITORY }}
+          ref: ${{ inputs.templates-ref }}
+          token: ${{ secrets.TEMPLATES_REPO_TOKEN || secrets.ENV_SETTINGS_TOKEN || github.token }}
+          path: .mdf-templates
+          persist-credentials: false
+
+      - name: Get Anypoint Access Token
+        id: getAccessToken
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: get-anypoint-token.sh
+        env:
+          MDF_CONNECTED_APP_CLIENT_ID: ${{ secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_CLIENT_SECRET: ${{ secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+
+      - name: Capture Current Deployed Version
+        id: CaptureVersion
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: get-current-deployed-version.sh
+        env:
+          MDF_BEARER_TOKEN: ${{ fromJSON(steps.getAccessToken.outputs.json).bearerToken }}
+          MDF_ARTIFACT_ID: ${{ needs.pre-deploy.outputs.artifact-id }}
+          MDF_GROUP_ID: ${{ needs.pre-deploy.outputs.group-id }}
+          MDF_DEPLOYMENT_TARGET: ${{ inputs.deployment-target }}
+          MDF_BG_ID: ${{ env.WAVE_BG_ID }}
+          MDF_ENV_ID: ${{ env.WAVE_ENV_ID }}
+          MDF_MULE_ENV: ${{ inputs.tier }}
+
+  create-api-components:
+    name: Create API Components
+    needs: [pre-deploy, capture-version]
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      api-id: ${{ fromJSON(steps.CreateAPIManagerInstance.outputs.json || '{}').API_ID }}
+      is-api: ${{ fromJSON(steps.setActionFlags.outputs.json || '{}').IS_API }}
+    steps:
+      - name: Checkout pipeline templates
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.WAVE_TEMPLATES_REPOSITORY }}
+          ref: ${{ inputs.templates-ref }}
+          token: ${{ secrets.TEMPLATES_REPO_TOKEN || secrets.ENV_SETTINGS_TOKEN || github.token }}
+          path: .mdf-templates
+          persist-credentials: false
+
+      - name: Checkout env-settings
+        uses: ./.mdf-templates/.github/actions/checkout-env-settings
+        with:
+          repository: ${{ inputs.env-settings-repository }}
+          ref: ${{ inputs.env-settings-ref }}
+          token: ${{ secrets.ENV_SETTINGS_TOKEN }}
+
+      - name: Download Mule Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mule-application-artifacts-${{ env.WAVE_PRE_DEPLOY_STAGE }}
+          path: ${{ runner.temp }}/pw/mule-artifacts
+
+      - name: Download Build Metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: build-metadata
+          path: ${{ runner.temp }}/pw/build-metadata
+
+      - name: Detect API Flags & RAML Coordinates
+        id: setActionFlags
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: detect-api-flags.sh
+        env:
+          MDF_ARTIFACT_ID: ${{ needs.pre-deploy.outputs.artifact-id }}
+          MDF_CLASSIFIER: ${{ inputs.classifier }}
+          MDF_ENV_SETTINGS_PATH: ${{ inputs.env-settings-path }}
+
+      - name: Get Anypoint Access Token
+        id: getAccessToken
+        if: fromJSON(steps.setActionFlags.outputs.json).IS_API == 'true'
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: get-anypoint-token.sh
+        env:
+          MDF_CONNECTED_APP_CLIENT_ID: ${{ secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_CLIENT_SECRET: ${{ secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+
+      - name: Create API Manager Instance
+        id: CreateAPIManagerInstance
+        if: fromJSON(steps.setActionFlags.outputs.json).IS_API == 'true'
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: create-api-manager-instance.sh
+        env:
+          MDF_BEARER_TOKEN: ${{ fromJSON(steps.getAccessToken.outputs.json || '{}').bearerToken }}
+          MDF_ARTIFACT_ID: ${{ needs.pre-deploy.outputs.artifact-id }}
+          MDF_RAML_GROUP_ID: ${{ fromJSON(steps.setActionFlags.outputs.json).ramlGroupId }}
+          MDF_RAML_ARTIFACT_ID: ${{ fromJSON(steps.setActionFlags.outputs.json).ramlArtifactId }}
+          MDF_RAML_VERSION: ${{ fromJSON(steps.setActionFlags.outputs.json).ramlVersion }}
+          MDF_BG_ID: ${{ env.WAVE_BG_ID }}
+          MDF_ENV_ID: ${{ env.WAVE_ENV_ID }}
+
+      - name: Apply Policies to API Manager
+        if: fromJSON(steps.setActionFlags.outputs.json).IS_API == 'true' && fromJSON(steps.setActionFlags.outputs.json).APPLY_POLICIES == 'true'
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: apply-api-manager-policies.sh
+        env:
+          MDF_BEARER_TOKEN: ${{ fromJSON(steps.getAccessToken.outputs.json || '{}').bearerToken }}
+          MDF_API_ID: ${{ fromJSON(steps.CreateAPIManagerInstance.outputs.json || '{}').API_ID }}
+          MDF_POLICIES_PATH: ${{ fromJSON(steps.setActionFlags.outputs.json).policiesPath }}
+          MDF_BG_ID: ${{ env.WAVE_BG_ID }}
+          MDF_ENV_ID: ${{ env.WAVE_ENV_ID }}
+
+      - name: Add SLA Tiers to API Manager Instance
+        if: fromJSON(steps.setActionFlags.outputs.json).IS_API == 'true' && fromJSON(steps.setActionFlags.outputs.json).APPLY_SLA == 'true'
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: add-sla-tiers.sh
+        env:
+          MDF_BEARER_TOKEN: ${{ fromJSON(steps.getAccessToken.outputs.json || '{}').bearerToken }}
+          MDF_API_ID: ${{ fromJSON(steps.CreateAPIManagerInstance.outputs.json || '{}').API_ID }}
+          MDF_SLA_TIERS_PATH: ${{ fromJSON(steps.setActionFlags.outputs.json).slaTiersPath }}
+          MDF_BG_ID: ${{ env.WAVE_BG_ID }}
+          MDF_ENV_ID: ${{ env.WAVE_ENV_ID }}
+
+      - name: Create Client Application
+        id: CreateClientApplication
+        if: fromJSON(steps.setActionFlags.outputs.json).APPLY_CONTRACTS == 'true'
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: create-client-application.sh
+        env:
+          MDF_BEARER_TOKEN: ${{ fromJSON(steps.getAccessToken.outputs.json || '{}').bearerToken }}
+          MDF_CLIENT_APPLICATION_NAME: ${{ needs.pre-deploy.outputs.artifact-id }}
+          MDF_API_INSTANCE_ID: ${{ fromJSON(steps.CreateAPIManagerInstance.outputs.json || '{}').API_ID }}
+          MDF_BG_ID: ${{ env.WAVE_BG_ID }}
+
+      - name: Create Contracts
+        if: fromJSON(steps.setActionFlags.outputs.json).APPLY_CONTRACTS == 'true'
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: create-contracts.sh
+        env:
+          MDF_BEARER_TOKEN: ${{ fromJSON(steps.getAccessToken.outputs.json || '{}').bearerToken }}
+          MDF_CONTRACTS_PATH: ${{ fromJSON(steps.setActionFlags.outputs.json).contractsPath }}
+          MDF_CLIENT_APP_ID: ${{ fromJSON(steps.CreateClientApplication.outputs.json || '{}').CLIENT_APP_ID }}
+          MDF_API_ID: ${{ fromJSON(steps.CreateAPIManagerInstance.outputs.json || '{}').API_ID }}
+          MDF_BG_ID: ${{ env.WAVE_BG_ID }}
+          MDF_ENV_ID: ${{ env.WAVE_ENV_ID }}
+
+  deploy:
+    name: Deploy Mule Application
+    needs: [pre-deploy, create-api-components]
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Checkout pipeline templates
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.WAVE_TEMPLATES_REPOSITORY }}
+          ref: ${{ inputs.templates-ref }}
+          token: ${{ secrets.TEMPLATES_REPO_TOKEN || secrets.ENV_SETTINGS_TOKEN || github.token }}
+          path: .mdf-templates
+          persist-credentials: false
+
+      - name: Checkout env-settings
+        uses: ./.mdf-templates/.github/actions/checkout-env-settings
+        with:
+          repository: ${{ inputs.env-settings-repository }}
+          ref: ${{ inputs.env-settings-ref }}
+          token: ${{ secrets.ENV_SETTINGS_TOKEN }}
+
+      - name: Download Mule Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mule-application-artifacts-${{ env.WAVE_PRE_DEPLOY_STAGE }}
+          path: ${{ runner.temp }}/pw/mule-artifacts
+
+      - name: Download Deploy Config
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-config-${{ env.WAVE_PRE_DEPLOY_STAGE }}
+          path: ${{ runner.temp }}/pw/mule-artifacts
+
+      - name: Setup Java, settings.xml and Maven cache
+        uses: ./.mdf-templates/.github/actions/setup-maven-settings
+        with:
+          settings-xml-b64: ${{ secrets[inputs.settings-xml-secret] }}
+          cache-key: maven-deploy-${{ runner.os }}-${{ github.run_number }}
+          cache-restore-keys: |
+            maven-deploy-${{ runner.os }}
+            maven-${{ runner.os }}
+
+      - name: Deploy to ${{ inputs.deployment-target }} Runtime
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: deploy-mule-app.sh
+        env:
+          MDF_ARTIFACT_ID: ${{ needs.pre-deploy.outputs.artifact-id }}
+          MDF_VERSION: ${{ needs.pre-deploy.outputs.version }}
+          MDF_DEPLOYMENT_TARGET: ${{ inputs.deployment-target }}
+          MDF_API_ID: ${{ needs.create-api-components.outputs.api-id }}
+          MDF_IS_API_MANAGER: ${{ needs.create-api-components.outputs.is-api }}
+          MDF_CONNECTED_APP_ID: ${{ secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_SECRET: ${{ secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+          MDF_ENV_ID: ${{ env.WAVE_ENV_ID }}
+          MDF_ENV_NAME: ${{ env.WAVE_ENV_NAME }}
+          MDF_BG_ID: ${{ env.WAVE_BG_ID }}
+          MDF_SECURE_KEY: ${{ secrets[format('{0}_SECURE_KEY', inputs.tier)] }}
+          MDF_ENV_CLIENT_ID: ${{ secrets[format('{0}_{1}_ENV_CLIENT_ID', inputs.bg-prefix, inputs.tier)] || secrets[format('{0}_ENV_CLIENT_ID', inputs.tier)] }}
+          MDF_ENV_CLIENT_SECRET: ${{ secrets[format('{0}_{1}_ENV_CLIENT_SECRET', inputs.bg-prefix, inputs.tier)] || secrets[format('{0}_ENV_CLIENT_SECRET', inputs.tier)] }}
+          MDF_ENV_SETTINGS_PATH: ${{ inputs.env-settings-path }}
+          MDF_MULE_ENV: ${{ inputs.tier }}
+
+  tag-env-settings:
+    name: Tag env-settings for rollback
+    if: inputs.tier == 'PROD'
+    needs: [pre-deploy, deploy]
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Checkout pipeline templates
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.WAVE_TEMPLATES_REPOSITORY }}
+          ref: ${{ inputs.templates-ref }}
+          token: ${{ secrets.TEMPLATES_REPO_TOKEN || secrets.ENV_SETTINGS_TOKEN || github.token }}
+          path: .mdf-templates
+          persist-credentials: false
+
+      - name: Checkout env-settings
+        uses: ./.mdf-templates/.github/actions/checkout-env-settings
+        with:
+          repository: ${{ inputs.env-settings-repository }}
+          ref: ${{ inputs.env-settings-ref }}
+          token: ${{ secrets.ENV_SETTINGS_TOKEN }}
+          persist-credentials: 'true'
+
+      - name: Create env-settings rollback tag
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: tag-env-settings-rollback.sh
+        env:
+          MDF_VERSION: ${{ needs.pre-deploy.outputs.version }}
+
+  # ── Rollback_<Tier>_<bg> (runs only when the deploy jobs failed and rollback is enabled) ────
+  rollback-pre-deploy:
+    name: Pre-Deploy (Rollback to ${{ needs.capture-version.outputs.prev-version }})
+    needs: [capture-version, create-api-components, deploy, tag-env-settings]
+    if: failure() && inputs.enable-rollback && needs.capture-version.outputs.prev-version != ''
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Checkout pipeline templates
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.WAVE_TEMPLATES_REPOSITORY }}
+          ref: ${{ inputs.templates-ref }}
+          token: ${{ secrets.TEMPLATES_REPO_TOKEN || secrets.ENV_SETTINGS_TOKEN || github.token }}
+          path: .mdf-templates
+          persist-credentials: false
+
+      - name: Checkout env-settings
+        uses: ./.mdf-templates/.github/actions/checkout-env-settings
+        with:
+          repository: ${{ inputs.env-settings-repository }}
+          ref: ${{ inputs.env-settings-ref }}
+          token: ${{ secrets.ENV_SETTINGS_TOKEN }}
+          fetch-tags: 'true'
+
+      - name: Checkout env-settings at rollback tag
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: checkout-env-settings-rollback-tag.sh
+        env:
+          MDF_PREV_VERSION: ${{ needs.capture-version.outputs.prev-version }}
+          MDF_MULE_ENV: ${{ inputs.tier }}
+
+      - name: Setup Java, settings.xml and Maven cache
+        uses: ./.mdf-templates/.github/actions/setup-maven-settings
+        with:
+          settings-xml-b64: ${{ secrets[inputs.settings-xml-secret] }}
+          cache-key: maven-${{ runner.os }}-download-${{ needs.capture-version.outputs.prev-artifact-id }}
+          cache-restore-keys: maven-${{ runner.os }}
+
+      - name: Download Artifact from Maven repository
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: download-artifacts.sh
+        env:
+          MDF_GROUP_ID: ${{ needs.capture-version.outputs.prev-group-id }}
+          MDF_ARTIFACT_ID: ${{ needs.capture-version.outputs.prev-artifact-id }}
+          MDF_VERSION: ${{ needs.capture-version.outputs.prev-version }}
+          MDF_CLASSIFIER: ${{ inputs.classifier }}
+
+      - name: Publish Mule Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mule-application-artifacts-${{ env.WAVE_ROLLBACK_STAGE }}
+          path: ${{ runner.temp }}/pw/mule-artifacts
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Get Anypoint Access Token
+        id: getAccessToken
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: get-anypoint-token.sh
+        env:
+          MDF_CONNECTED_APP_CLIENT_ID: ${{ secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_CLIENT_SECRET: ${{ secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+
+      - name: 'Pre-Deploy: Transform JAR for ${{ inputs.tier }}'
+        id: preDeploy
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: pre-deploy-mule-app.sh
+        env:
+          MDF_ARTIFACT_ID: ${{ needs.capture-version.outputs.prev-artifact-id }}
+          MDF_VERSION: ${{ needs.capture-version.outputs.prev-version }}
+          MDF_CLASSIFIER: ${{ inputs.classifier }}
+          MDF_ENV_SETTINGS_PATH: ${{ inputs.env-settings-path }}
+          MDF_MULE_ENV: ${{ inputs.tier }}
+          MDF_DEPLOYMENT_TARGET: ${{ inputs.deployment-target }}
+          MDF_BG_ID: ${{ env.WAVE_BG_ID }}
+
+      - name: Generate deploy-pom.xml
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: generate-deploy-pom.sh
+        env:
+          MDF_ARTIFACT_ID: ${{ needs.capture-version.outputs.prev-artifact-id }}
+          MDF_VERSION: ${{ needs.capture-version.outputs.prev-version }}
+          MDF_DEPLOYMENT_TARGET: ${{ inputs.deployment-target }}
+          MDF_BG_ID: ${{ env.WAVE_BG_ID }}
+          MDF_PARENT_GROUP_ID: ${{ fromJSON(steps.preDeploy.outputs.json).parentGroupId }}
+          MDF_PARENT_ARTIFACT_ID: ${{ fromJSON(steps.preDeploy.outputs.json).parentArtifactId }}
+          MDF_PARENT_VERSION: ${{ fromJSON(steps.preDeploy.outputs.json).parentVersion }}
+          MDF_PROJECT_GROUP_ID: ${{ fromJSON(steps.preDeploy.outputs.json).projectGroupId }}
+
+      - name: Publish to Exchange (CH2/RTF)
+        if: inputs.deployment-target == 'ch2' || inputs.deployment-target == 'rtf'
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: publish-to-exchange.sh
+        env:
+          MDF_ARTIFACT_ID: ${{ needs.capture-version.outputs.prev-artifact-id }}
+          MDF_VERSION: ${{ needs.capture-version.outputs.prev-version }}
+          MDF_CLASSIFIER: ${{ inputs.classifier }}
+          MDF_BG_ID: ${{ env.WAVE_BG_ID }}
+          MDF_BEARER_TOKEN: ${{ fromJSON(steps.getAccessToken.outputs.json).bearerToken }}
+          MDF_PARENT_GROUP_ID: ${{ fromJSON(steps.preDeploy.outputs.json).parentGroupId }}
+          MDF_PARENT_ARTIFACT_ID: ${{ fromJSON(steps.preDeploy.outputs.json).parentArtifactId }}
+          MDF_PARENT_VERSION: ${{ fromJSON(steps.preDeploy.outputs.json).parentVersion }}
+
+      - name: Publish Deploy Config
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-config-${{ env.WAVE_ROLLBACK_STAGE }}
+          path: ${{ runner.temp }}/pw/mule-artifacts/deploy-pom.xml
+          if-no-files-found: error
+          overwrite: true
+
+  rollback-deploy:
+    name: Deploy (Rollback to ${{ needs.capture-version.outputs.prev-version }})
+    needs: [capture-version, rollback-pre-deploy]
+    if: ${{ !cancelled() && needs.rollback-pre-deploy.result == 'success' }}
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Checkout pipeline templates
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.WAVE_TEMPLATES_REPOSITORY }}
+          ref: ${{ inputs.templates-ref }}
+          token: ${{ secrets.TEMPLATES_REPO_TOKEN || secrets.ENV_SETTINGS_TOKEN || github.token }}
+          path: .mdf-templates
+          persist-credentials: false
+
+      - name: Checkout env-settings
+        uses: ./.mdf-templates/.github/actions/checkout-env-settings
+        with:
+          repository: ${{ inputs.env-settings-repository }}
+          ref: ${{ inputs.env-settings-ref }}
+          token: ${{ secrets.ENV_SETTINGS_TOKEN }}
+          fetch-tags: 'true'
+
+      - name: Checkout env-settings at rollback tag
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: checkout-env-settings-rollback-tag.sh
+        env:
+          MDF_PREV_VERSION: ${{ needs.capture-version.outputs.prev-version }}
+          MDF_MULE_ENV: ${{ inputs.tier }}
+
+      - name: Download Mule Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mule-application-artifacts-${{ env.WAVE_ROLLBACK_STAGE }}
+          path: ${{ runner.temp }}/pw/mule-artifacts
+
+      - name: Download Deploy Config
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-config-${{ env.WAVE_ROLLBACK_STAGE }}
+          path: ${{ runner.temp }}/pw/mule-artifacts
+
+      - name: Setup Java, settings.xml and Maven cache
+        uses: ./.mdf-templates/.github/actions/setup-maven-settings
+        with:
+          settings-xml-b64: ${{ secrets[inputs.settings-xml-secret] }}
+          cache-key: maven-deploy-${{ runner.os }}-${{ github.run_number }}
+          cache-restore-keys: |
+            maven-deploy-${{ runner.os }}
+            maven-${{ runner.os }}
+
+      - name: Deploy to ${{ inputs.deployment-target }} Runtime
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: deploy-mule-app.sh
+        env:
+          MDF_ARTIFACT_ID: ${{ needs.capture-version.outputs.prev-artifact-id }}
+          MDF_VERSION: ${{ needs.capture-version.outputs.prev-version }}
+          MDF_DEPLOYMENT_TARGET: ${{ inputs.deployment-target }}
+          MDF_CONNECTED_APP_ID: ${{ secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_SECRET: ${{ secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+          MDF_ENV_ID: ${{ env.WAVE_ENV_ID }}
+          MDF_ENV_NAME: ${{ env.WAVE_ENV_NAME }}
+          MDF_BG_ID: ${{ env.WAVE_BG_ID }}
+          MDF_SECURE_KEY: ${{ secrets[format('{0}_SECURE_KEY', inputs.tier)] }}
+          MDF_ENV_CLIENT_ID: ${{ secrets[format('{0}_{1}_ENV_CLIENT_ID', inputs.bg-prefix, inputs.tier)] || secrets[format('{0}_ENV_CLIENT_ID', inputs.tier)] }}
+          MDF_ENV_CLIENT_SECRET: ${{ secrets[format('{0}_{1}_ENV_CLIENT_SECRET', inputs.bg-prefix, inputs.tier)] || secrets[format('{0}_ENV_CLIENT_SECRET', inputs.tier)] }}
+          MDF_ENV_SETTINGS_PATH: ${{ inputs.env-settings-path }}
+          MDF_MULE_ENV: ${{ inputs.tier }}

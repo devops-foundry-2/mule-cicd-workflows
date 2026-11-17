@@ -1,0 +1,145 @@
+# ============================================================================================
+# build-and-pre-release.yml — GitHub form of pipelines/build-and-pre-release-template.yml
+# (merge to develop): Build SNAPSHOT -> DEV wave (all BGs) -> SIT wave (all BGs).
+#
+# business-groups is a JSON array, in deploy order, e.g.
+#   '[{"key":"gdc","prefix":"GDC"},{"key":"emea","prefix":"EMEA"}]'
+# (Azure businessGroups object; `prefix` selects the <PREFIX>_* variables/secrets of that BG.)
+#
+# multi-bg-mode:
+#   sequential (Azure default) — one BG at a time per wave, stop on first failure; SIT starts
+#               after the whole DEV wave (Azure Dev_Wave_Complete barrier).
+#   parallel    — BGs of a wave run concurrently. NOTE: GitHub cannot chain matrix legs, so SIT
+#               still waits for the whole DEV wave (Azure starts each BG's SIT after its own DEV).
+# ============================================================================================
+name: mdf-build-and-pre-release
+
+on:
+  workflow_call:
+    inputs:
+      deployment-target:
+        type: string
+        required: false
+        default: ch2
+      maven-goals:
+        type: string
+        required: false
+        default: clean deploy
+      maven-options:
+        type: string
+        required: false
+        default: -Xmx4096m
+      skip-tests:
+        type: boolean
+        required: false
+        default: true
+      settings-xml-secret:
+        type: string
+        required: false
+        default: MAVEN_SETTINGS_XML
+      runs-on:
+        type: string
+        required: false
+        default: ubuntu-latest
+      multi-bg-mode:
+        type: string
+        required: false
+        default: sequential
+      enable-rollback-dev:
+        type: boolean
+        required: false
+        default: false
+      enable-rollback-sit:
+        type: boolean
+        required: false
+        default: false
+      business-groups:
+        type: string
+        required: false
+        default: '[{"key":"gdc","prefix":"GDC"}]'
+      templates-repository:
+        type: string
+        required: false
+        default: ''
+      templates-ref:
+        type: string
+        required: false
+        default: main
+      env-settings-repository:
+        type: string
+        required: false
+        default: ''
+      env-settings-ref:
+        type: string
+        required: false
+        default: develop
+
+concurrency:
+  group: mdf-pipeline-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build & Publish
+    uses: ./.github/workflows/build.yml
+    with:
+      maven-goals: ${{ inputs.maven-goals }}
+      maven-options: ${{ inputs.maven-options }}
+      skip-tests: ${{ inputs.skip-tests }}
+      settings-xml-secret: ${{ inputs.settings-xml-secret }}
+      runs-on: ${{ inputs.runs-on }}
+      templates-repository: ${{ inputs.templates-repository }}
+      templates-ref: ${{ inputs.templates-ref }}
+    secrets: inherit
+
+  dev:
+    name: DEV (${{ matrix.bg.key }})
+    needs: build
+    strategy:
+      fail-fast: ${{ inputs.multi-bg-mode == 'sequential' }}
+      max-parallel: ${{ inputs.multi-bg-mode == 'sequential' && 1 || 64 }}
+      matrix:
+        bg: ${{ fromJSON(inputs.business-groups) }}
+    uses: ./.github/workflows/deploy-cloudhub2.yml
+    with:
+      tier: Design
+      stage-label: Design
+      env-settings-path: env-settings/design
+      bg-key: ${{ matrix.bg.key }}
+      bg-prefix: ${{ matrix.bg.prefix }}
+      github-environment: ${{ matrix.bg.prefix != '' && format('{0}-Design', matrix.bg.prefix) || 'Design' }}
+      deployment-target: ${{ inputs.deployment-target }}
+      enable-rollback: ${{ inputs.enable-rollback-dev }}
+      runs-on: ${{ inputs.runs-on }}
+      settings-xml-secret: ${{ inputs.settings-xml-secret }}
+      templates-repository: ${{ inputs.templates-repository }}
+      templates-ref: ${{ inputs.templates-ref }}
+      env-settings-repository: ${{ inputs.env-settings-repository }}
+      env-settings-ref: ${{ inputs.env-settings-ref }}
+    secrets: inherit
+
+  sit:
+    name: SIT (${{ matrix.bg.key }})
+    needs: dev
+    strategy:
+      fail-fast: ${{ inputs.multi-bg-mode == 'sequential' }}
+      max-parallel: ${{ inputs.multi-bg-mode == 'sequential' && 1 || 64 }}
+      matrix:
+        bg: ${{ fromJSON(inputs.business-groups) }}
+    uses: ./.github/workflows/deploy-cloudhub2.yml
+    with:
+      tier: Sandbox
+      stage-label: Sandbox
+      env-settings-path: env-settings/sandbox
+      bg-key: ${{ matrix.bg.key }}
+      bg-prefix: ${{ matrix.bg.prefix }}
+      github-environment: ${{ matrix.bg.prefix != '' && format('{0}-Sandbox', matrix.bg.prefix) || 'Sandbox' }}
+      deployment-target: ${{ inputs.deployment-target }}
+      enable-rollback: ${{ inputs.enable-rollback-sit }}
+      runs-on: ${{ inputs.runs-on }}
+      settings-xml-secret: ${{ inputs.settings-xml-secret }}
+      templates-repository: ${{ inputs.templates-repository }}
+      templates-ref: ${{ inputs.templates-ref }}
+      env-settings-repository: ${{ inputs.env-settings-repository }}
+      env-settings-ref: ${{ inputs.env-settings-ref }}
+    secrets: inherit

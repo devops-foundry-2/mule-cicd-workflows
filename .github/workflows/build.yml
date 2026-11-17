@@ -1,0 +1,125 @@
+# ============================================================================================
+# build.yml — the Azure `Build` stage (stages/build.yml): optional approval gate, optional
+# SNAPSHOT strip, Maven build + publish, build-metadata.json, optional release-version commit.
+# Called by build-and-pre-release.yml and release.yml.
+# ============================================================================================
+name: mdf-build
+
+on:
+  workflow_call:
+    inputs:
+      maven-goals:
+        type: string
+        required: false
+        default: clean deploy
+      maven-options:
+        type: string
+        required: false
+        default: -Xmx4096m
+      skip-tests:
+        type: boolean
+        required: false
+        default: true
+      strip-snapshot:
+        type: boolean
+        required: false
+        default: false
+      environment:
+        description: GitHub Environment to gate the build on (Azure ApprovalGate). Empty = no gate.
+        type: string
+        required: false
+        default: ''
+      runs-on:
+        type: string
+        required: false
+        default: ubuntu-latest
+      settings-xml-secret:
+        type: string
+        required: false
+        default: MAVEN_SETTINGS_XML
+      templates-repository:
+        type: string
+        required: false
+        default: ''
+      templates-ref:
+        type: string
+        required: false
+        default: main
+
+env:
+  BUILD_TEMPLATES_REPOSITORY: ${{ inputs.templates-repository != '' && inputs.templates-repository || format('{0}/mule-cicd-workflows', github.repository_owner) }}
+
+jobs:
+  approve:
+    name: Approval Gate (${{ inputs.environment }})
+    if: inputs.environment != ''
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Approval Confirmed
+        env:
+          MDF_ENVIRONMENT: ${{ inputs.environment }}
+        run: echo "Approval granted for ${MDF_ENVIRONMENT}. Proceeding with build."
+
+  build:
+    name: Build Mule Application
+    needs: approve
+    if: ${{ !cancelled() && (needs.approve.result == 'success' || needs.approve.result == 'skipped') }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout pipeline templates
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BUILD_TEMPLATES_REPOSITORY }}
+          ref: ${{ inputs.templates-ref }}
+          token: ${{ secrets.TEMPLATES_REPO_TOKEN || secrets.ENV_SETTINGS_TOKEN || github.token }}
+          path: .mdf-templates
+          persist-credentials: false
+
+      - name: Strip SNAPSHOT Version
+        if: inputs.strip-snapshot
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: strip-snapshot-version.sh
+
+      - name: Setup Java, settings.xml and Maven cache
+        uses: ./.mdf-templates/.github/actions/setup-maven-settings
+        with:
+          settings-xml-b64: ${{ secrets[inputs.settings-xml-secret] }}
+          cache-key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          cache-restore-keys: maven-${{ runner.os }}
+
+      - name: Build Mule Application
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: build-mule-app.sh
+        env:
+          MDF_MAVEN_GOALS: ${{ inputs.maven-goals }}
+          MDF_MAVEN_OPTIONS: ${{ inputs.maven-options }}
+          MDF_SKIP_TESTS: ${{ inputs.skip-tests && 'True' || 'False' }}
+
+      - name: Generate Build Metadata
+        id: buildMetadata
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: generate-build-metadata.sh
+
+      - name: Publish Build Metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata
+          path: ${{ runner.temp }}/artifact-staging/build-metadata
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Commit Release Version
+        if: inputs.strip-snapshot
+        uses: ./.mdf-templates/.github/actions/run-ci-script
+        with:
+          script: commit-release-version.sh
+        env:
+          MDF_RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
