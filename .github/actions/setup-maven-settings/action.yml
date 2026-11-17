@@ -1,34 +1,54 @@
 name: setup-maven-settings
 description: >-
-  GitHub equivalent of the Azure JavaToolInstaller@0 (JDK 17, pre-installed) + DownloadSecureFile@1
-  (settings.xml) + Cache@2 (Maven repository) step trio. Writes the decoded settings.xml to the runner
-  temp dir and exports MDF_SETTINGS_XML (the scripts' $(settingsXml.secureFilePath)) for later steps.
+  Sets up JDK 17 + Maven 3.9.4 + the Maven cache, then GENERATES settings.xml inline from
+  individual org-level secrets (never a pre-baked base64 blob). This keeps each secret value
+  separate in GitHub secret storage — only the raw credentials live in GitHub, never a filled
+  file. Writes the generated file to the runner temp dir and exports MDF_SETTINGS_XML.
+
+  Inputs are component secrets passed by the caller via env. None appear in logs.
 
 inputs:
-  settings-xml-b64:
-    description: >-
-      Base64-encoded settings.xml (pass a secret, e.g. secrets.MAVEN_SETTINGS_XML). The plugin's
-      plane_upload_secure_file seeds it as base64 so newlines survive the secret store.
+  github-token:
+    description: GITHUB_TOKEN for GitHub Packages auth (read/write).
     required: true
-  cache-key:
+  github-username:
+    description: Username for the GitHub Packages <server>. Defaults to the actor.
+    required: false
+    default: ''
+  mulesoft-ee-username:
+    description: MuleSoft EE repository username (Anypoint Platform username).
+    required: false
+    default: ''
+  mulesoft-ee-password:
+    description: MuleSoft EE repository password (Anypoint Platform password).
+    required: false
+    default: ''
+  anypoint-exchange-client-id:
     description: >-
-      actions/cache key for the Maven repository (mirrors the Azure Cache@2 key of the step).
-      Empty = no cache (for steps that have no Cache@2 on Azure).
+      Anypoint Exchange v3 server username. Use '~~~' (the literal tilde × 3 convention) when
+      the password holds a Connected App client_secret; otherwise the Connected App client_id.
+    required: false
+    default: '~~~'
+  anypoint-exchange-client-secret:
+    description: Anypoint Exchange v3 Connected App client_secret.
+    required: false
+    default: ''
+  cache-key:
+    description: actions/cache key for the Maven repository.
     required: false
     default: ''
   cache-restore-keys:
-    description: actions/cache restore-keys (mirrors the Azure Cache@2 restoreKeys).
+    description: actions/cache restore-keys.
     required: false
     default: ''
   java-version:
-    description: JDK major version (Mule 4.x runtimes require 17).
+    description: JDK major version (Mule 4.x requires 17).
     required: false
     default: '17'
   maven-version:
     description: >-
-      Maven version put on PATH. mule-maven-plugin 4.x calls the Maven Resolver API
-      DefaultMirrorSelector.add(), which the resolver shipped with newer Maven 3.9.x no longer has
-      (NoSuchMethodError at process-sources). 3.9.4 is the last verified version.
+      Maven version. mule-maven-plugin 4.x needs <= 3.9.4 — newer resolvers dropped
+      DefaultMirrorSelector.add() (NoSuchMethodError at process-sources).
     required: false
     default: '3.9.4'
 
@@ -91,50 +111,65 @@ runs:
         key: ${{ inputs.cache-key }}
         restore-keys: ${{ inputs.cache-restore-keys }}
 
-    - shell: bash
+    - name: Generate settings.xml inline from org secrets
+      shell: bash
       env:
-        MDF_SETTINGS_B64: ${{ inputs.settings-xml-b64 }}
+        MDF_GITHUB_USERNAME: ${{ inputs.github-username != '' && inputs.github-username || github.actor }}
+        MDF_GITHUB_TOKEN: ${{ inputs.github-token }}
+        MDF_EE_USERNAME: ${{ inputs.mulesoft-ee-username }}
+        MDF_EE_PASSWORD: ${{ inputs.mulesoft-ee-password }}
+        MDF_EXCHANGE_ID: ${{ inputs.anypoint-exchange-client-id }}
+        MDF_EXCHANGE_SECRET: ${{ inputs.anypoint-exchange-client-secret }}
       run: |
         set -euo pipefail
-        if [[ -z "$MDF_SETTINGS_B64" || "$MDF_SETTINGS_B64" == "__FILL_ME__" ]]; then
-          echo "::error::settings.xml secret is empty or still the __FILL_ME__ placeholder. Upload the base64 settings.xml (plugin activity: secure files) before running."
+        # Fail-fast on missing GITHUB_TOKEN — the only universally required credential
+        if [[ -z "${MDF_GITHUB_TOKEN:-}" ]]; then
+          echo "::error::GITHUB_TOKEN was not supplied to setup-maven-settings. Caller must pass secrets.GITHUB_TOKEN."
           exit 1
         fi
+
         dir="$RUNNER_TEMP/mdf-secure-files"
         mkdir -p "$dir"
         chmod 700 "$dir"
         file="$dir/settings.xml"
         umask 077
-        if ! printf '%s' "$MDF_SETTINGS_B64" | base64 -d > "$file" 2>/dev/null || [[ ! -s "$file" ]]; then
-          echo "::error::settings.xml secret is not valid base64."
-          exit 1
-        fi
+
+        # Compose settings.xml. Empty optional sections are OMITTED so an un-filled org secret
+        # is a clean "not configured" rather than embedding an empty <password/> that Maven
+        # would send as an empty-string credential.
+        {
+          echo '<?xml version="1.0" encoding="UTF-8"?>'
+          echo '<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"'
+          echo '          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+          echo '          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0'
+          echo '                              https://maven.apache.org/xsd/settings-1.0.0.xsd">'
+          echo '  <servers>'
+          # GitHub Packages (always present)
+          echo '    <server>'
+          echo '      <id>github</id>'
+          printf '      <username>%s</username>\n' "$MDF_GITHUB_USERNAME"
+          printf '      <password>%s</password>\n' "$MDF_GITHUB_TOKEN"
+          echo '    </server>'
+          # MuleSoft EE (optional — only emit if BOTH username and password are set)
+          if [[ -n "${MDF_EE_USERNAME:-}" && -n "${MDF_EE_PASSWORD:-}" ]]; then
+            echo '    <server>'
+            echo '      <id>mulesoft-ee-releases</id>'
+            printf '      <username>%s</username>\n' "$MDF_EE_USERNAME"
+            printf '      <password>%s</password>\n' "$MDF_EE_PASSWORD"
+            echo '    </server>'
+          fi
+          # Anypoint Exchange v3 (optional — only emit if client_secret is set)
+          if [[ -n "${MDF_EXCHANGE_SECRET:-}" ]]; then
+            echo '    <server>'
+            echo '      <id>anypoint-exchange-v3</id>'
+            printf '      <username>%s</username>\n' "${MDF_EXCHANGE_ID:-~~~}"
+            printf '      <password>%s</password>\n' "$MDF_EXCHANGE_SECRET"
+            echo '    </server>'
+          fi
+          echo '  </servers>'
+          echo '</settings>'
+        } > "$file"
+
         mkdir -p "$RUNNER_TEMP/pw/.m2/repository"
         echo "MDF_SETTINGS_XML=$file" >> "$GITHUB_ENV"
-
-    - name: Validate settings.xml — no foreign platform repositories
-      shell: bash
-      run: |
-        set -euo pipefail
-        # Refuse a settings.xml of another control plane, organization or repository host.
-        # Never print its content, hosts or names: the job log is visible to everyone with read access.
-        f="$RUNNER_TEMP/mdf-secure-files/settings.xml"
-        fix="Re-upload MAVEN_SETTINGS_XML with the clean GitHub-only settings.xml generated during onboarding."
-        if grep -qiE 'dev\.azure\.com|visualstudio\.com|azure-artifacts|Azure Artifacts|Azure FEED PAT|ADO SECURE FILE|Pipelines -> Library|DownloadSecureFile|SYSTEM_ACCESSTOKEN|System\.AccessToken|ONBOARDING_PAT' "$f"; then
-          echo "::error::settings.xml holds Azure DevOps content (Azure Artifacts feeds, server ids or ADO instructions). $fix"
-          exit 1
-        fi
-        gh_host="$(printf '%s' "${GITHUB_SERVER_URL:-https://github.com}" | sed -E 's#^https?://##; s#/.*$##' | tr '[:upper:]' '[:lower:]')"
-        while IFS= read -r host; do
-          case "$host" in
-            maven.pkg.github.com|repository.mulesoft.org|repository-master.mulesoft.org|repo1.maven.org|repo.maven.apache.org|maven.anypoint.mulesoft.com|*.anypoint.mulesoft.com|"$gh_host"|"maven.$gh_host") ;;
-            *)
-              echo "::error::settings.xml has a repository outside GitHub Packages, MuleSoft, Maven Central and Anypoint Exchange. $fix"
-              exit 1 ;;
-          esac
-        done < <(grep -oiE '<url>[^<]*</url>' "$f" | sed -E 's#<[^>]*>##g; s#^[[:space:]]*[A-Za-z]+://##; s#^[^/@]*@##; s#[/:?].*$##' | tr '[:upper:]' '[:lower:]')
-        if grep -oiE '(maven\.pkg\.github\.com|/_registry/maven)/[A-Za-z0-9_.-]+' "$f" | sed -E 's#.*/##' | grep -vixF "$GITHUB_REPOSITORY_OWNER" >/dev/null; then
-          echo "::error::settings.xml points at GitHub Packages of another organization. $fix"
-          exit 1
-        fi
-        echo "settings.xml platform check passed."
+        echo "Generated settings.xml at $file (inline, from org secrets)."

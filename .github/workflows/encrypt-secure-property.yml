@@ -76,8 +76,10 @@ jobs:
       - name: Setup Java and settings.xml
         uses: ./.mdf-templates/.github/actions/setup-maven-settings
         with:
-          settings-xml-b64: ${{ secrets[inputs.settings-xml-secret] }}
-
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mulesoft-ee-username: ${{ secrets.MULESOFT_EE_USERNAME }}
+          mulesoft-ee-password: ${{ secrets.MULESOFT_EE_PASSWORD }}
+          anypoint-exchange-client-secret: ${{ secrets.ANYPOINT_EXCHANGE_CLIENT_SECRET }}
       - name: Download secure-properties-tool from Maven repository
         id: downloadTool
         uses: ./.mdf-templates/.github/actions/run-ci-script
