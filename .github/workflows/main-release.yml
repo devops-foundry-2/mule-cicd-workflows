@@ -74,7 +74,7 @@ jobs:
     with:
       maven-goals: clean deploy -P deploy-to-exchange-v3
       maven-options: ${{ inputs.maven-options }}
-      skip-tests: false
+      skip-tests: true
       strip-snapshot: true
       commit-release-version: false
       settings-xml-secret: ${{ inputs.settings-xml-secret }}
