@@ -21,6 +21,17 @@ on:
         required: false
         default: true
       strip-snapshot:
+        description: >-
+          Strip the -SNAPSHOT suffix from pom.xml before the build. Ephemeral — the stripped
+          pom.xml is NOT committed back unless commit-release-version is also true.
+        type: boolean
+        required: false
+        default: false
+      commit-release-version:
+        description: >-
+          After a strip-snapshot build, commit the released pom.xml back to the source branch.
+          Requires contents:write on the caller and the workflow identity to be exempt from
+          branch protection — otherwise the push fails. Default false (safer for protected main).
         type: boolean
         required: false
         default: false
@@ -120,7 +131,7 @@ jobs:
           overwrite: true
 
       - name: Commit Release Version
-        if: inputs.strip-snapshot
+        if: inputs.strip-snapshot && inputs.commit-release-version
         uses: ./.mdf-templates/.github/actions/run-ci-script
         with:
           script: commit-release-version.sh

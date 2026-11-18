@@ -1,0 +1,181 @@
+# ============================================================================================
+# main-release.yml — Trunk-based release flow.
+#
+# Fires on every push to main. Builds a RELEASED artifact (SNAPSHOT stripped ephemerally),
+# deploys to Production per Business Group (each gated by its GitHub Environment reviewer),
+# then tags the main commit at vX.Y.Z and creates a GitHub Release.
+#
+# Design choices:
+# - Ephemeral SNAPSHOT strip only (commit-release-version=false). pom.xml on main stays at
+#   `X.Y.Z-SNAPSHOT`; the build strips to `X.Y.Z` for the duration of the build; main-branch
+#   protection does not need to be bypassed.
+# - For the NEXT release, a developer bumps pom.xml to `X.Y.(Z+1)-SNAPSHOT` in a feature PR.
+# - Tag + GitHub Release are created AFTER both BGs' Production deploys succeed — a failure
+#   anywhere in the Production wave short-circuits the tag, so the version isn't claimed by
+#   a half-released artifact.
+# - Design and Sandbox are NOT part of this flow. Those are tested via feature-deploy
+#   (workflow_dispatch from a feature branch) before the merge.
+# ============================================================================================
+name: mdf-main-release
+
+on:
+  workflow_call:
+    inputs:
+      deployment-target:
+        type: string
+        required: false
+        default: ch2
+      maven-options:
+        type: string
+        required: false
+        default: -Xmx4096m
+      settings-xml-secret:
+        type: string
+        required: false
+        default: MAVEN_SETTINGS_XML
+      runs-on:
+        type: string
+        required: false
+        default: ubuntu-latest
+      multi-bg-mode:
+        description: sequential (one BG at a time) | parallel (all BGs at once, still per-BG gated)
+        type: string
+        required: false
+        default: sequential
+      business-groups:
+        type: string
+        required: false
+        default: '[{"key":"emea","prefix":"EMEA"}]'
+      templates-repository:
+        type: string
+        required: false
+        default: ''
+      templates-ref:
+        type: string
+        required: false
+        default: main
+      env-settings-repository:
+        type: string
+        required: false
+        default: ''
+      env-settings-ref:
+        type: string
+        required: false
+        default: main
+
+concurrency:
+  group: mdf-main-release-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-build:
+    name: Build released artifact (strip SNAPSHOT ephemerally)
+    uses: ./.github/workflows/build.yml
+    with:
+      maven-goals: clean deploy -P deploy-to-exchange-v3
+      maven-options: ${{ inputs.maven-options }}
+      skip-tests: false
+      strip-snapshot: true
+      commit-release-version: false
+      settings-xml-secret: ${{ inputs.settings-xml-secret }}
+      runs-on: ${{ inputs.runs-on }}
+      templates-repository: ${{ inputs.templates-repository }}
+      templates-ref: ${{ inputs.templates-ref }}
+    secrets: inherit
+
+  prod:
+    name: PROD (${{ matrix.bg.key }})
+    needs: release-build
+    strategy:
+      fail-fast: ${{ inputs.multi-bg-mode == 'sequential' }}
+      max-parallel: ${{ inputs.multi-bg-mode == 'sequential' && 1 || 64 }}
+      matrix:
+        bg: ${{ fromJSON(inputs.business-groups) }}
+    uses: ./.github/workflows/deploy-cloudhub2.yml
+    with:
+      tier: Production
+      stage-label: Production
+      env-settings-path: env-settings/production
+      bg-key: ${{ matrix.bg.key }}
+      bg-prefix: ${{ matrix.bg.prefix }}
+      github-environment: ${{ matrix.bg.prefix != '' && format('{0}-Production', matrix.bg.prefix) || 'Production' }}
+      deployment-target: ${{ inputs.deployment-target }}
+      enable-rollback: false
+      runs-on: ${{ inputs.runs-on }}
+      settings-xml-secret: ${{ inputs.settings-xml-secret }}
+      templates-repository: ${{ inputs.templates-repository }}
+      templates-ref: ${{ inputs.templates-ref }}
+      env-settings-repository: ${{ inputs.env-settings-repository }}
+      env-settings-ref: ${{ inputs.env-settings-ref }}
+    secrets: inherit
+
+  tag-and-release:
+    name: Tag + GitHub Release
+    needs: prod
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Resolve released version from pom.xml
+        id: ver
+        run: |
+          set -euo pipefail
+          # Read the PROJECT version (first <version> after <artifactId>, not the parent version).
+          v=$(python3 - <<'PY'
+          import re, pathlib
+          text = pathlib.Path('pom.xml').read_text()
+          # Strip the <parent> block so its <version> doesn't win
+          text = re.sub(r'<parent>.*?</parent>', '', text, flags=re.DOTALL)
+          m = re.search(r'<version>([^<]+)</version>', text)
+          print(m.group(1) if m else '')
+          PY
+          )
+          # Strip -SNAPSHOT suffix
+          v="${v%-SNAPSHOT}"
+          if [[ -z "$v" ]]; then
+            echo "::error::Could not resolve project version from pom.xml"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Released version resolved: $v"
+
+      - name: Fail if tag already exists
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git rev-parse "v$V" >/dev/null 2>&1; then
+            echo "::error::Tag v$V already exists. Bump pom.xml to the next version in a feature PR before merging to main."
+            exit 1
+          fi
+
+      - name: Create annotated tag
+        env:
+          V: ${{ steps.ver.outputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git tag -a "v$V" -m "Release v$V"
+          git push origin "v$V"
+          echo "Pushed tag v$V"
+
+      - name: Create GitHub Release
+        env:
+          V: ${{ steps.ver.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "v$V" \
+            --title "v$V" \
+            --generate-notes \
+            --latest \
+            --verify-tag
