@@ -54,7 +54,7 @@ on:
 
 permissions:
   contents: write
-  packages: read
+  packages: write
 
 jobs:
   # ── PR validation — MUnit + quality gates, no deploy ────────────────────────
