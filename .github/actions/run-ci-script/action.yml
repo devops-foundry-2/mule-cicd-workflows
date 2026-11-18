@@ -1,13 +1,14 @@
 name: run-ci-script
 description: >-
-  Run one core/ci script (extracted from the Azure DevOps templates) under the GitHub Actions
-  ci-shim and expose everything it publishes with ci_set_var / ci_set_secret_var as a single JSON
-  output. Script inputs are passed as MDF_* variables in the env: of the step that uses this action.
+  Run one CI script under the GitHub Actions ci-shim and expose everything it publishes with
+  ci_set_var / ci_set_secret_var as a single JSON output. Script inputs are passed as MDF_*
+  variables in the env: of the step that uses this action. Scripts live at the repo's `scripts/`
+  directory (we renamed from the golden `core/ci/` layout on first copy).
   Read outputs with fromJSON(steps.<id>.outputs.json).<name>.
 
 inputs:
   script:
-    description: File name of the script under core/ci (e.g. build-mule-app.sh).
+    description: File name of the script under `scripts/` (e.g. build-mule-app.sh).
     required: true
 
 outputs:
@@ -22,7 +23,7 @@ runs:
       shell: bash
       working-directory: ${{ github.workspace }}
       env:
-        MDF_CORE_CI_DIR: ${{ github.action_path }}/../../../core/ci
+        MDF_CORE_CI_DIR: ${{ github.action_path }}/../../../scripts
         MDF_CI_SCRIPT: ${{ inputs.script }}
       run: |
         set -euo pipefail
@@ -32,7 +33,7 @@ runs:
         fi
         core_dir="$(cd "$MDF_CORE_CI_DIR" && pwd)"
         if [[ ! -f "$core_dir/$MDF_CI_SCRIPT" ]]; then
-          echo "::error::run-ci-script: core/ci/$MDF_CI_SCRIPT not found next to this action ($core_dir)"
+          echo "::error::run-ci-script: scripts/$MDF_CI_SCRIPT not found next to this action ($core_dir)"
           exit 1
         fi
 
