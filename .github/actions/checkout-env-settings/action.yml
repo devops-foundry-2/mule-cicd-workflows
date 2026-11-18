@@ -14,8 +14,12 @@ inputs:
     required: false
     default: develop
   token:
-    description: Token with contents:read on the env-settings repository (contents:write when pushing tags).
-    required: true
+    description: >-
+      Token with contents:read on the env-settings repository (contents:write when pushing
+      rollback tags). Empty = fall back to the workflow's github.token — sufficient for a
+      PUBLIC env-settings repo and when rollback tagging is disabled.
+    required: false
+    default: ''
   fetch-tags:
     description: Fetch tags (Azure checkout fetchTags) — needed by the rollback tag checkout.
     required: false
@@ -32,7 +36,7 @@ runs:
       with:
         repository: ${{ inputs.repository != '' && inputs.repository || format('{0}/mule-app-env-settings', github.repository_owner) }}
         ref: ${{ inputs.ref }}
-        token: ${{ inputs.token }}
+        token: ${{ inputs.token != '' && inputs.token || github.token }}
         path: env-settings
         fetch-tags: ${{ inputs.fetch-tags }}
         fetch-depth: ${{ inputs.fetch-tags == 'true' && '0' || '1' }}

@@ -23,7 +23,7 @@ on:
       enable-rollback:
         type: boolean
         required: false
-        default: true
+        default: false
       multi-bg-mode:
         type: string
         required: false
