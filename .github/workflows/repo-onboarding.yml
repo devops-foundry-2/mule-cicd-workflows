@@ -11,7 +11,8 @@
 #
 # Secrets: ONBOARDING_TOKEN — a token for the script's GitHub work only (repo create, contents,
 #   workflows, administration for rulesets; classic PAT scopes repo + workflow + admin:org). It is NOT a
-#   Maven credential. MAVEN_SETTINGS_XML — the base64 settings.xml for `mvn archetype:generate`.
+#   Maven credential. Maven settings.xml is GENERATED INLINE at runtime by the setup-maven-settings
+#   composite action from the org-level secrets (MULESOFT_EE_*, ANYPOINT_EXCHANGE_CLIENT_SECRET).
 # ============================================================================================
 name: repo-onboarding
 
@@ -80,74 +81,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Java 17 (needed for Maven)
-        uses: actions/setup-java@v4
+      # Setup Java 17, Maven 3.9.4, Maven cache, AND generate settings.xml inline from org secrets.
+      # The composite action lives in THIS repo (mule-cicd-workflows), so the relative path is used.
+      - name: Setup Java, Maven, and settings.xml (inline from org secrets)
+        uses: ./.github/actions/setup-maven-settings
         with:
-          distribution: temurin
-          java-version: '17'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mulesoft-ee-username: ${{ secrets.MULESOFT_EE_USERNAME }}
+          mulesoft-ee-password: ${{ secrets.MULESOFT_EE_PASSWORD }}
+          anypoint-exchange-client-secret: ${{ secrets.ANYPOINT_EXCHANGE_CLIENT_SECRET }}
 
-      # mule-maven-plugin 4.x needs Maven <= 3.9.4 (newer resolvers dropped DefaultMirrorSelector.add()).
-      - name: Use Maven ${{ vars.MDF_MAVEN_VERSION || '3.9.4' }}
-        env:
-          MDF_MVN_VERSION: ${{ vars.MDF_MAVEN_VERSION || '3.9.4' }}
-        run: |
-          set -euo pipefail
-          [[ "$MDF_MVN_VERSION" =~ ^3\.[0-9]+\.[0-9]+$ ]] || { echo "::error::MDF_MAVEN_VERSION '$MDF_MVN_VERSION' is not a Maven 3.x.y version."; exit 1; }
-          current="$(mvn --version 2>/dev/null | sed -nE 's/^Apache Maven ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)" || current=""
-          if [[ "$current" == "$MDF_MVN_VERSION" ]]; then
-            echo "Maven $MDF_MVN_VERSION already installed — skipping download."
-            exit 0
-          fi
-          dir="$RUNNER_TEMP/apache-maven-$MDF_MVN_VERSION"
-          if [[ ! -x "$dir/bin/mvn" ]]; then
-            echo "Installing Maven $MDF_MVN_VERSION (runner has ${current:-none})..."
-            url="https://archive.apache.org/dist/maven/maven-3/$MDF_MVN_VERSION/binaries/apache-maven-$MDF_MVN_VERSION-bin.tar.gz"
-            tgz="$RUNNER_TEMP/apache-maven-$MDF_MVN_VERSION-bin.tar.gz"
-            curl -fsSL --retry 3 -o "$tgz" "$url"
-            want="$(curl -fsSL --retry 3 "$url.sha512" | awk '{print $1}')"
-            if command -v sha512sum >/dev/null 2>&1; then got="$(sha512sum "$tgz" | awk '{print $1}')"; else got="$(shasum -a 512 "$tgz" | awk '{print $1}')"; fi
-            [[ -n "$want" && "$got" == "$want" ]] || { echo "::error::Maven $MDF_MVN_VERSION download failed its SHA-512 check."; exit 1; }
-            tar -xzf "$tgz" -C "$RUNNER_TEMP"
-            rm -f "$tgz"
-          fi
-          echo "$dir/bin" >> "$GITHUB_PATH"
-          echo "Installed Maven $MDF_MVN_VERSION at $dir/bin/mvn"
-
-      # Archetype credentials live in the settings.xml server (as on Azure); nothing secret is passed to
-      # the script through env except the onboarding token.
-      - name: Download Maven settings.xml (archetype credentials)
-        env:
-          SETTINGS_B64: ${{ secrets.MAVEN_SETTINGS_XML }}
-        run: |
-          set -euo pipefail
-          if [[ -z "$SETTINGS_B64" || "$SETTINGS_B64" == "__FILL_ME__" ]]; then
-            echo "::warning::MAVEN_SETTINGS_XML is not set — mvn falls back to ~/.m2/settings.xml (the archetype model needs it)."
-            exit 0
-          fi
-          dir="$RUNNER_TEMP/mdf-secure-files"; mkdir -p "$dir"; chmod 700 "$dir"; umask 077
-          printf '%s' "$SETTINGS_B64" | base64 -d > "$dir/settings.xml"
-          # Refuse a settings.xml of another control plane, organization or repository host.
-          # Never print its content, hosts or names: the job log is visible to everyone with read access.
-          f="$dir/settings.xml"
-          fix="Re-upload MAVEN_SETTINGS_XML with the clean GitHub-only settings.xml generated during onboarding."
-          if grep -qiE 'dev\.azure\.com|visualstudio\.com|azure-artifacts|Azure Artifacts|Azure FEED PAT|ADO SECURE FILE|Pipelines -> Library|DownloadSecureFile|SYSTEM_ACCESSTOKEN|System\.AccessToken|ONBOARDING_PAT' "$f"; then
-            echo "::error::MAVEN_SETTINGS_XML holds Azure DevOps content (Azure Artifacts feeds, server ids or ADO instructions). $fix"
-            exit 1
-          fi
-          gh_host="$(printf '%s' "${GITHUB_SERVER_URL:-https://github.com}" | sed -E 's#^https?://##; s#/.*$##' | tr '[:upper:]' '[:lower:]')"
-          while IFS= read -r host; do
-            case "$host" in
-              maven.pkg.github.com|repository.mulesoft.org|repository-master.mulesoft.org|repo1.maven.org|repo.maven.apache.org|maven.anypoint.mulesoft.com|*.anypoint.mulesoft.com|"$gh_host"|"maven.$gh_host") ;;
-              *)
-                echo "::error::MAVEN_SETTINGS_XML has a repository outside GitHub Packages, MuleSoft, Maven Central and Anypoint Exchange. $fix"
-                exit 1 ;;
-            esac
-          done < <(grep -oiE '<url>[^<]*</url>' "$f" | sed -E 's#<[^>]*>##g; s#^[[:space:]]*[A-Za-z]+://##; s#^[^/@]*@##; s#[/:?].*$##' | tr '[:upper:]' '[:lower:]')
-          if grep -oiE '(maven\.pkg\.github\.com|/_registry/maven)/[A-Za-z0-9_.-]+' "$f" | sed -E 's#.*/##' | grep -vixF "$GITHUB_REPOSITORY_OWNER" >/dev/null; then
-            echo "::error::MAVEN_SETTINGS_XML points at GitHub Packages of another organization. $fix"
-            exit 1
-          fi
-          echo "MAVEN_SETTINGS_PATH=$dir/settings.xml" >> "$GITHUB_ENV"
+      - name: Alias MAVEN_SETTINGS_PATH for the onboarding script
+        run: echo "MAVEN_SETTINGS_PATH=$MDF_SETTINGS_XML" >> "$GITHUB_ENV"
 
       - name: Execute onboarding script
         env:

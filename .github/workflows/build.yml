@@ -89,7 +89,10 @@ jobs:
       - name: Setup Java, settings.xml and Maven cache
         uses: ./.mdf-templates/.github/actions/setup-maven-settings
         with:
-          settings-xml-b64: ${{ secrets[inputs.settings-xml-secret] }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mulesoft-ee-username: ${{ secrets.MULESOFT_EE_USERNAME }}
+          mulesoft-ee-password: ${{ secrets.MULESOFT_EE_PASSWORD }}
+          anypoint-exchange-client-secret: ${{ secrets.ANYPOINT_EXCHANGE_CLIENT_SECRET }}
           cache-key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
           cache-restore-keys: maven-${{ runner.os }}
 

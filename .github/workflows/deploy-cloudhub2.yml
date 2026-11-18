@@ -138,7 +138,7 @@ jobs:
         with:
           repository: ${{ inputs.env-settings-repository }}
           ref: ${{ inputs.env-settings-ref }}
-          token: ${{ secrets.ENV_SETTINGS_TOKEN }}
+          token: ${{ secrets.ENV_SETTINGS_TOKEN || github.token }}
 
       - name: Check business-group configuration
         env:
@@ -168,7 +168,10 @@ jobs:
       - name: Setup Java, settings.xml and Maven cache
         uses: ./.mdf-templates/.github/actions/setup-maven-settings
         with:
-          settings-xml-b64: ${{ secrets[inputs.settings-xml-secret] }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mulesoft-ee-username: ${{ secrets.MULESOFT_EE_USERNAME }}
+          mulesoft-ee-password: ${{ secrets.MULESOFT_EE_PASSWORD }}
+          anypoint-exchange-client-secret: ${{ secrets.ANYPOINT_EXCHANGE_CLIENT_SECRET }}
           cache-key: maven-${{ runner.os }}-download-${{ fromJSON(steps.resolveGAV.outputs.json).resolvedArtifactId }}
           cache-restore-keys: maven-${{ runner.os }}
 
@@ -197,8 +200,8 @@ jobs:
         with:
           script: get-anypoint-token.sh
         env:
-          MDF_CONNECTED_APP_CLIENT_ID: ${{ secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
-          MDF_CONNECTED_APP_CLIENT_SECRET: ${{ secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_CLIENT_ID: ${{ secrets[format('{0}_{1}_CONNECTED_APP_ID', inputs.bg-prefix, inputs.tier == 'Production' && 'PROD' || 'NONPROD')] || secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'Production' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_CLIENT_SECRET: ${{ secrets[format('{0}_{1}_CONNECTED_APP_SECRET', inputs.bg-prefix, inputs.tier == 'Production' && 'PROD' || 'NONPROD')] || secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'Production' && 'PROD' || 'NONPROD')] }}
 
       - name: 'Pre-Deploy: Transform JAR for ${{ inputs.tier }}'
         id: preDeploy
@@ -279,8 +282,8 @@ jobs:
         with:
           script: get-anypoint-token.sh
         env:
-          MDF_CONNECTED_APP_CLIENT_ID: ${{ secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
-          MDF_CONNECTED_APP_CLIENT_SECRET: ${{ secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_CLIENT_ID: ${{ secrets[format('{0}_{1}_CONNECTED_APP_ID', inputs.bg-prefix, inputs.tier == 'Production' && 'PROD' || 'NONPROD')] || secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'Production' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_CLIENT_SECRET: ${{ secrets[format('{0}_{1}_CONNECTED_APP_SECRET', inputs.bg-prefix, inputs.tier == 'Production' && 'PROD' || 'NONPROD')] || secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'Production' && 'PROD' || 'NONPROD')] }}
 
       - name: Capture Current Deployed Version
         id: CaptureVersion
@@ -318,7 +321,7 @@ jobs:
         with:
           repository: ${{ inputs.env-settings-repository }}
           ref: ${{ inputs.env-settings-ref }}
-          token: ${{ secrets.ENV_SETTINGS_TOKEN }}
+          token: ${{ secrets.ENV_SETTINGS_TOKEN || github.token }}
 
       - name: Download Mule Artifacts
         uses: actions/download-artifact@v4
@@ -349,8 +352,8 @@ jobs:
         with:
           script: get-anypoint-token.sh
         env:
-          MDF_CONNECTED_APP_CLIENT_ID: ${{ secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
-          MDF_CONNECTED_APP_CLIENT_SECRET: ${{ secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_CLIENT_ID: ${{ secrets[format('{0}_{1}_CONNECTED_APP_ID', inputs.bg-prefix, inputs.tier == 'Production' && 'PROD' || 'NONPROD')] || secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'Production' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_CLIENT_SECRET: ${{ secrets[format('{0}_{1}_CONNECTED_APP_SECRET', inputs.bg-prefix, inputs.tier == 'Production' && 'PROD' || 'NONPROD')] || secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'Production' && 'PROD' || 'NONPROD')] }}
 
       - name: Create API Manager Instance
         id: CreateAPIManagerInstance
@@ -435,7 +438,7 @@ jobs:
         with:
           repository: ${{ inputs.env-settings-repository }}
           ref: ${{ inputs.env-settings-ref }}
-          token: ${{ secrets.ENV_SETTINGS_TOKEN }}
+          token: ${{ secrets.ENV_SETTINGS_TOKEN || github.token }}
 
       - name: Download Mule Artifacts
         uses: actions/download-artifact@v4
@@ -452,7 +455,10 @@ jobs:
       - name: Setup Java, settings.xml and Maven cache
         uses: ./.mdf-templates/.github/actions/setup-maven-settings
         with:
-          settings-xml-b64: ${{ secrets[inputs.settings-xml-secret] }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mulesoft-ee-username: ${{ secrets.MULESOFT_EE_USERNAME }}
+          mulesoft-ee-password: ${{ secrets.MULESOFT_EE_PASSWORD }}
+          anypoint-exchange-client-secret: ${{ secrets.ANYPOINT_EXCHANGE_CLIENT_SECRET }}
           cache-key: maven-deploy-${{ runner.os }}-${{ github.run_number }}
           cache-restore-keys: |
             maven-deploy-${{ runner.os }}
@@ -468,8 +474,8 @@ jobs:
           MDF_DEPLOYMENT_TARGET: ${{ inputs.deployment-target }}
           MDF_API_ID: ${{ needs.create-api-components.outputs.api-id }}
           MDF_IS_API_MANAGER: ${{ needs.create-api-components.outputs.is-api }}
-          MDF_CONNECTED_APP_ID: ${{ secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
-          MDF_CONNECTED_APP_SECRET: ${{ secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_ID: ${{ secrets[format('{0}_{1}_CONNECTED_APP_ID', inputs.bg-prefix, inputs.tier == 'Production' && 'PROD' || 'NONPROD')] || secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'Production' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_SECRET: ${{ secrets[format('{0}_{1}_CONNECTED_APP_SECRET', inputs.bg-prefix, inputs.tier == 'Production' && 'PROD' || 'NONPROD')] || secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'Production' && 'PROD' || 'NONPROD')] }}
           MDF_ENV_ID: ${{ env.WAVE_ENV_ID }}
           MDF_ENV_NAME: ${{ env.WAVE_ENV_NAME }}
           MDF_BG_ID: ${{ env.WAVE_BG_ID }}
@@ -499,7 +505,7 @@ jobs:
         with:
           repository: ${{ inputs.env-settings-repository }}
           ref: ${{ inputs.env-settings-ref }}
-          token: ${{ secrets.ENV_SETTINGS_TOKEN }}
+          token: ${{ secrets.ENV_SETTINGS_TOKEN || github.token }}
           persist-credentials: 'true'
 
       - name: Create env-settings rollback tag
@@ -530,7 +536,7 @@ jobs:
         with:
           repository: ${{ inputs.env-settings-repository }}
           ref: ${{ inputs.env-settings-ref }}
-          token: ${{ secrets.ENV_SETTINGS_TOKEN }}
+          token: ${{ secrets.ENV_SETTINGS_TOKEN || github.token }}
           fetch-tags: 'true'
 
       - name: Checkout env-settings at rollback tag
@@ -544,7 +550,10 @@ jobs:
       - name: Setup Java, settings.xml and Maven cache
         uses: ./.mdf-templates/.github/actions/setup-maven-settings
         with:
-          settings-xml-b64: ${{ secrets[inputs.settings-xml-secret] }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mulesoft-ee-username: ${{ secrets.MULESOFT_EE_USERNAME }}
+          mulesoft-ee-password: ${{ secrets.MULESOFT_EE_PASSWORD }}
+          anypoint-exchange-client-secret: ${{ secrets.ANYPOINT_EXCHANGE_CLIENT_SECRET }}
           cache-key: maven-${{ runner.os }}-download-${{ needs.capture-version.outputs.prev-artifact-id }}
           cache-restore-keys: maven-${{ runner.os }}
 
@@ -572,8 +581,8 @@ jobs:
         with:
           script: get-anypoint-token.sh
         env:
-          MDF_CONNECTED_APP_CLIENT_ID: ${{ secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
-          MDF_CONNECTED_APP_CLIENT_SECRET: ${{ secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_CLIENT_ID: ${{ secrets[format('{0}_{1}_CONNECTED_APP_ID', inputs.bg-prefix, inputs.tier == 'Production' && 'PROD' || 'NONPROD')] || secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'Production' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_CLIENT_SECRET: ${{ secrets[format('{0}_{1}_CONNECTED_APP_SECRET', inputs.bg-prefix, inputs.tier == 'Production' && 'PROD' || 'NONPROD')] || secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'Production' && 'PROD' || 'NONPROD')] }}
 
       - name: 'Pre-Deploy: Transform JAR for ${{ inputs.tier }}'
         id: preDeploy
@@ -646,7 +655,7 @@ jobs:
         with:
           repository: ${{ inputs.env-settings-repository }}
           ref: ${{ inputs.env-settings-ref }}
-          token: ${{ secrets.ENV_SETTINGS_TOKEN }}
+          token: ${{ secrets.ENV_SETTINGS_TOKEN || github.token }}
           fetch-tags: 'true'
 
       - name: Checkout env-settings at rollback tag
@@ -672,7 +681,10 @@ jobs:
       - name: Setup Java, settings.xml and Maven cache
         uses: ./.mdf-templates/.github/actions/setup-maven-settings
         with:
-          settings-xml-b64: ${{ secrets[inputs.settings-xml-secret] }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mulesoft-ee-username: ${{ secrets.MULESOFT_EE_USERNAME }}
+          mulesoft-ee-password: ${{ secrets.MULESOFT_EE_PASSWORD }}
+          anypoint-exchange-client-secret: ${{ secrets.ANYPOINT_EXCHANGE_CLIENT_SECRET }}
           cache-key: maven-deploy-${{ runner.os }}-${{ github.run_number }}
           cache-restore-keys: |
             maven-deploy-${{ runner.os }}
@@ -686,8 +698,8 @@ jobs:
           MDF_ARTIFACT_ID: ${{ needs.capture-version.outputs.prev-artifact-id }}
           MDF_VERSION: ${{ needs.capture-version.outputs.prev-version }}
           MDF_DEPLOYMENT_TARGET: ${{ inputs.deployment-target }}
-          MDF_CONNECTED_APP_ID: ${{ secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
-          MDF_CONNECTED_APP_SECRET: ${{ secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'PROD' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_ID: ${{ secrets[format('{0}_{1}_CONNECTED_APP_ID', inputs.bg-prefix, inputs.tier == 'Production' && 'PROD' || 'NONPROD')] || secrets[format('{0}_CONNECTED_APP_ID', inputs.tier == 'Production' && 'PROD' || 'NONPROD')] }}
+          MDF_CONNECTED_APP_SECRET: ${{ secrets[format('{0}_{1}_CONNECTED_APP_SECRET', inputs.bg-prefix, inputs.tier == 'Production' && 'PROD' || 'NONPROD')] || secrets[format('{0}_CONNECTED_APP_SECRET', inputs.tier == 'Production' && 'PROD' || 'NONPROD')] }}
           MDF_ENV_ID: ${{ env.WAVE_ENV_ID }}
           MDF_ENV_NAME: ${{ env.WAVE_ENV_NAME }}
           MDF_BG_ID: ${{ env.WAVE_BG_ID }}
