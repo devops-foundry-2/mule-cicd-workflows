@@ -51,6 +51,14 @@ inputs:
       DefaultMirrorSelector.add() (NoSuchMethodError at process-sources).
     required: false
     default: '3.9.4'
+  parent-pom-repo:
+    description: >-
+      GitHub Packages repo path (<owner>/<repo>) that hosts the parent POM artifact.
+      Added to settings.xml as an always-active profile so Maven can resolve the parent
+      before loading it (chicken-and-egg: parent's own <repositories> aren't visible yet).
+      Default: <this-run's-owner>/mtd-parent-pom.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -120,6 +128,7 @@ runs:
         MDF_EE_PASSWORD: ${{ inputs.mulesoft-ee-password }}
         MDF_EXCHANGE_ID: ${{ inputs.anypoint-exchange-client-id }}
         MDF_EXCHANGE_SECRET: ${{ inputs.anypoint-exchange-client-secret }}
+        MDF_PARENT_POM_REPO: ${{ inputs.parent-pom-repo != '' && inputs.parent-pom-repo || format('{0}/mtd-parent-pom', github.repository_owner) }}
       run: |
         set -euo pipefail
         # Fail-fast on missing GITHUB_TOKEN — the only universally required credential
@@ -167,6 +176,60 @@ runs:
             echo '    </server>'
           fi
           echo '  </servers>'
+          # ─ Repositories profile — resolves the parent POM + MuleSoft + Exchange artifacts.
+          # Maven needs these BEFORE loading the project POM; the parent's own <repositories>
+          # are only visible after the parent resolves, hence this always-active profile.
+          echo '  <profiles>'
+          echo '    <profile>'
+          echo '      <id>mdf-repos</id>'
+          echo '      <repositories>'
+          echo '        <repository>'
+          echo '          <id>github</id>'
+          printf '          <url>https://maven.pkg.github.com/%s</url>\n' "$MDF_PARENT_POM_REPO"
+          echo '          <releases><enabled>true</enabled></releases>'
+          echo '          <snapshots><enabled>true</enabled></snapshots>'
+          echo '        </repository>'
+          echo '        <repository>'
+          echo '          <id>mulesoft-releases</id>'
+          echo '          <url>https://repository.mulesoft.org/releases/</url>'
+          echo '          <releases><enabled>true</enabled></releases>'
+          echo '          <snapshots><enabled>false</enabled></snapshots>'
+          echo '        </repository>'
+          echo '        <repository>'
+          echo '          <id>anypoint-exchange-v3</id>'
+          echo '          <url>https://maven.anypoint.mulesoft.com/api/v3/maven</url>'
+          echo '          <releases><enabled>true</enabled></releases>'
+          echo '          <snapshots><enabled>true</enabled></snapshots>'
+          echo '        </repository>'
+          if [[ -n "${MDF_EE_PASSWORD:-}" ]]; then
+            echo '        <repository>'
+            echo '          <id>mulesoft-ee-releases</id>'
+            echo '          <url>https://repository.mulesoft.org/nexus-ee/content/repositories/releases-ee/</url>'
+            echo '        </repository>'
+          fi
+          echo '      </repositories>'
+          echo '      <pluginRepositories>'
+          echo '        <pluginRepository>'
+          echo '          <id>mulesoft-releases</id>'
+          echo '          <url>https://repository.mulesoft.org/releases/</url>'
+          echo '          <snapshots><enabled>false</enabled></snapshots>'
+          echo '        </pluginRepository>'
+          echo '        <pluginRepository>'
+          echo '          <id>anypoint-exchange-v3</id>'
+          echo '          <url>https://maven.anypoint.mulesoft.com/api/v3/maven</url>'
+          echo '        </pluginRepository>'
+          if [[ -n "${MDF_EE_PASSWORD:-}" ]]; then
+            echo '        <pluginRepository>'
+            echo '          <id>mulesoft-ee-releases</id>'
+            echo '          <url>https://repository.mulesoft.org/nexus-ee/content/repositories/releases-ee/</url>'
+            echo '        </pluginRepository>'
+          fi
+          echo '      </pluginRepositories>'
+          echo '    </profile>'
+          echo '  </profiles>'
+          echo '  <activeProfiles>'
+          echo '    <activeProfile>mdf-repos</activeProfile>'
+          echo '  </activeProfiles>'
           echo '</settings>'
         } > "$file"
 
