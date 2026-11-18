@@ -1,30 +1,28 @@
 # ============================================================
 # mule-ci.yml — Caller workflow template for a MuleSoft app repo.
-# Copy this file to .github/workflows/mule-ci.yml in the app repo
-# and replace every __PLACEHOLDER__ with the app-specific value.
+# Copy to .github/workflows/mule-ci.yml in the app repo and replace every __PLACEHOLDER__.
+#
+# Lifecycle (trunk-based):
+#   1. feature/* branch   → workflow_dispatch → deploy to Design or Sandbox (manual, per BG)
+#   2. PR to main         → validate (MUnit + quality gates, no deploy)
+#   3. merge to main      → strip SNAPSHOT (ephemeral) → build → Production per BG (approval gated)
+#                         → tag main at vX.Y.Z → GitHub Release
 #
 # Placeholders:
-#   __ORG__              devops-foundry-2 (the GitHub organisation)
+#   __ORG__              devops-foundry-2
 #   __TEMPLATES_REF__    main (or a pinned tag of mule-cicd-workflows)
 #   __DEPLOYMENT_TARGET__ ch2
-#   __BUSINESS_GROUPS__  JSON array in deploy order — primary BG first:
-#                        Single-region EMEA:  '[{"key":"emea","prefix":"EMEA"}]'
-#                        Single-region AMER:  '[{"key":"amer","prefix":"AMER"}]'
-#                        Dual-region:         '[{"key":"emea","prefix":"EMEA"},{"key":"amer","prefix":"AMER"}]'
+#   __BUSINESS_GROUPS__  JSON array, primary BG first, e.g.
+#                        '[{"key":"emea","prefix":"EMEA"},{"key":"amer","prefix":"AMER"}]'
 #
-# GitHub Environments required on the app repo (created by onboarding script):
-#   EMEA-Design, EMEA-Sandbox, EMEA-Production
-#   AMER-Design, AMER-Sandbox, AMER-Production  (dual-region only)
+# GitHub Environments required on the app repo (seeded at onboarding):
+#   EMEA-Design, EMEA-Sandbox, EMEA-Production   (required reviewer on *-Production only)
+#   AMER-Design, AMER-Sandbox, AMER-Production   (dual-region only)
 #
-# Repository / organisation configuration (seeded at onboarding):
-#   secrets  MAVEN_SETTINGS_XML (base64), ENV_SETTINGS_TOKEN,
-#            NONPROD_CONNECTED_APP_ID, NONPROD_CONNECTED_APP_SECRET,
-#            PROD_CONNECTED_APP_ID, PROD_CONNECTED_APP_SECRET,
-#            LOCAL_SECURE_KEY, DESIGN_SECURE_KEY, SANDBOX_SECURE_KEY, PRODUCTION_SECURE_KEY
-#   vars     EMEA_ANYPOINT_BG_ID, EMEA_DESIGN_ENV_ID, EMEA_DESIGN_ENV_NAME,
-#            EMEA_SANDBOX_ENV_ID, EMEA_SANDBOX_ENV_NAME,
-#            EMEA_PRODUCTION_ENV_ID, EMEA_PRODUCTION_ENV_NAME
-#            (and AMER_* equivalents for dual-region apps)
+# Config inherited from org level (visibility=all):
+#   secrets  NONPROD_/PROD_CONNECTED_APP_ID|SECRET per BG (<BG>_<NONPROD|PROD>_CONNECTED_APP_*)
+#            ANYPOINT_EXCHANGE_CLIENT_SECRET, *_SECURE_KEY (per tier)
+#   vars     <BG>_ANYPOINT_BG_ID, <BG>_<TIER>_ENV_ID, <BG>_<TIER>_ENV_NAME, CLOUDHUB2_SPACE
 # ============================================================
 name: mule-ci
 
@@ -32,16 +30,13 @@ on:
   push:
     branches:
       - main
-      - 'feature/**'
-      - 'bugfix/**'
-      - 'hotfix/**'
   pull_request:
     branches:
       - main
   workflow_dispatch:
     inputs:
       deploy-tier:
-        description: "Manual feature-branch deploy tier (Design or Sandbox)"
+        description: "Manual feature-branch deploy tier"
         required: true
         default: Design
         type: choice
@@ -62,7 +57,7 @@ permissions:
   packages: read
 
 jobs:
-  # ── PR validation ────────────────────────────────────────────────────────────
+  # ── PR validation — MUnit + quality gates, no deploy ────────────────────────
   pre-checks:
     name: PR Validation
     if: github.event_name == 'pull_request'
@@ -73,7 +68,7 @@ jobs:
       templates-ref: __TEMPLATES_REF__
     secrets: inherit
 
-  # ── Feature-branch manual deploy ─────────────────────────────────────────────
+  # ── Feature-branch manual deploy — Design or Sandbox for the picked BG ──────
   feature-deploy:
     name: Feature Deploy (${{ github.event.inputs.deploy-tier }} / ${{ github.event.inputs.bg-key }})
     if: github.event_name == 'workflow_dispatch'
@@ -87,24 +82,11 @@ jobs:
       env-settings-ref: main
     secrets: inherit
 
-  # ── Main branch: build SNAPSHOT + auto-deploy to Design then Sandbox ─────────
-  build-and-deploy:
-    name: Build & Deploy (Design → Sandbox)
+  # ── Main merge — strip SNAPSHOT → Production (gated per BG) → tag + release ──
+  main-release:
+    name: Main → Production
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    uses: __ORG__/mule-cicd-workflows/.github/workflows/build-publish.yml@__TEMPLATES_REF__
-    with:
-      deployment-target: __DEPLOYMENT_TARGET__
-      multi-bg-mode: sequential
-      business-groups: '__BUSINESS_GROUPS__'
-      templates-ref: __TEMPLATES_REF__
-      env-settings-ref: main
-    secrets: inherit
-
-  # ── vX.Y.Z tag: deploy to Production (approval-gated per BG) ─────────────────
-  production:
-    name: Production Deploy
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    uses: __ORG__/mule-cicd-workflows/.github/workflows/promote.yml@__TEMPLATES_REF__
+    uses: __ORG__/mule-cicd-workflows/.github/workflows/main-release.yml@__TEMPLATES_REF__
     with:
       deployment-target: __DEPLOYMENT_TARGET__
       multi-bg-mode: sequential

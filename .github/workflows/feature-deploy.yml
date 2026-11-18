@@ -79,7 +79,7 @@ jobs:
     with:
       tier: ${{ inputs.tier }}
       stage-label: ${{ inputs.tier }}
-      env-settings-path: env-settings/${{ lower(inputs.tier) }}
+      env-settings-path: ${{ inputs.tier == 'Design' && 'env-settings/design' || 'env-settings/sandbox' }}
       bg-key: ${{ inputs.bg-key }}
       bg-prefix: ${{ inputs.bg-prefix }}
       github-environment: ${{ inputs.bg-prefix }}-${{ inputs.tier }}
