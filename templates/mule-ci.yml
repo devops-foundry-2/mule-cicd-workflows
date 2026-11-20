@@ -89,7 +89,7 @@ jobs:
     uses: __ORG__/mule-cicd-workflows/.github/workflows/main-release.yml@__TEMPLATES_REF__
     with:
       deployment-target: __DEPLOYMENT_TARGET__
-      multi-bg-mode: sequential
+      multi-bg-mode: parallel
       business-groups: '__BUSINESS_GROUPS__'
       templates-ref: __TEMPLATES_REF__
       env-settings-ref: main
